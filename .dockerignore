@@ -1,0 +1,10 @@
+.env
+.env.*
+.git
+.gitignore
+target
+attached_assets
+.cache
+.local
+*.log
+README.md
