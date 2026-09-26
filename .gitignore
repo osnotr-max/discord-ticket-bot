@@ -1,0 +1,8 @@
+/target
+.env
+.env.local
+*.log
+*.exe
+/attached_assets/
+/.cache/
+/.local/
