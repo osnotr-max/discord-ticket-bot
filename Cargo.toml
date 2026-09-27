@@ -22,7 +22,7 @@ serenity = { version = "0.12.4", default-features = false, features = [
     "rustls_backend",
     "chrono",
 ] }
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 dashmap = "6.1.0"
 chrono = { version = "0.4.39", features = ["serde"] }
 dotenvy = "0.15.7"
