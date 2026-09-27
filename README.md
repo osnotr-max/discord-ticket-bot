@@ -33,6 +33,9 @@ The included `Dockerfile` builds and starts the bot automatically.
 This bot uses Discord Gateway WebSocket connections, so no HTTP port or
 `PORT` variable is required.
 
+The repository limits Rust compilation to one job and disables release LTO to
+keep CPU and RAM usage safe on small WispByte servers.
+
 ## Required environment variables
 
 Configure these as Secrets/Environment Variables in the provider. Do not
@@ -52,6 +55,7 @@ STAFF_ROLE_ID=1538753673847644270
 TRANSCRIPT_CHANNEL_ID=your_transcript_channel_id
 MAX_TICKETS_PER_USER=3
 COOLDOWN_CREATE_SECS=30
+ACTION_COOLDOWN_SECS=3
 MAX_TICKETS_PER_GUILD=50
 MENTION_STAFF_ON_CREATE=true
 MENTION_STAFF_ON_UNCLAIM=true
@@ -59,6 +63,10 @@ RUST_LOG=info
 ```
 
 If `TRANSCRIPT_CHANNEL_ID` is omitted, transcripts use `LOG_CHANNEL_ID`.
+
+`ACTION_COOLDOWN_SECS` limits repeated interactions per user and per action.
+It defaults to 3 seconds. Interaction responses remain immediate; the bot
+does not sleep before acknowledging Discord buttons or modals.
 
 ## Discord setup
 
