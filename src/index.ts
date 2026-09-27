@@ -206,7 +206,7 @@ function loadConfig(): Config {
     maxTicketsPerGuild: Math.max(1, integerEnv("MAX_TICKETS_PER_GUILD", 50)),
     mentionStaffOnCreate: boolEnv("MENTION_STAFF_ON_CREATE", true),
     mentionStaffOnUnclaim: boolEnv("MENTION_STAFF_ON_UNCLAIM", true),
-    maxTranscriptPages: Math.max(1, integerEnv("MAX_TRANSCRIPT_PAGES", 50))
+    maxTranscriptPages: Math.min(50, Math.max(1, integerEnv("MAX_TRANSCRIPT_PAGES", 50)))
   };
 }
 
@@ -230,9 +230,11 @@ async function discordRequest(path: string, init: RequestInit = {}, json?: unkno
     body = JSON.stringify(json);
   }
   const response = await fetch(`${API}${path}`, { ...init, headers, body });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`Discord ${response.status} ${path}: ${text.slice(0, 500)}`);
-  return text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Discord ${response.status} ${path}: ${text.slice(0, 500)}`);
+  }
+  return response.status === 204 ? null : response.json();
 }
 
 async function sendMessage(channelId: Snowflake, payload: Json, file?: { name: string; content: string }): Promise<Json> {

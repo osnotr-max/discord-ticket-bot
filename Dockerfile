@@ -4,8 +4,10 @@ WORKDIR /app
 COPY package.json tsconfig.json ./
 COPY src ./src
 
-# The runtime has no third-party dependency to install.
-RUN bun build src/index.ts --target bun --minify --outfile /usr/local/bin/ticket-bot.js
+# The runtime has no third-party dependency to install. Delete the source
+# after bundling so the deployment image contains only the executable bundle.
+RUN bun build src/index.ts --target bun --minify --outfile /usr/local/bin/ticket-bot.js \
+    && rm -rf /app/src /app/package.json /app/tsconfig.json
 
 ENV NODE_ENV=production
-CMD ["bun", "/usr/local/bin/ticket-bot.js"]
+CMD ["bun", "--smol", "/usr/local/bin/ticket-bot.js"]

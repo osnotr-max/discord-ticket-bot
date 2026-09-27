@@ -25,14 +25,14 @@ executable script for deployment.
 ```bash
 cp .env.example .env
 # fill .env with the Discord values
-bun run src/index.ts
+bun --smol run src/index.ts
 ```
 
 For a production build:
 
 ```bash
 bun run build
-bun /path/to/dist/ticket-bot.js
+bun --smol /path/to/dist/ticket-bot.js
 ```
 
 No HTTP port or `PORT` variable is needed. The bot connects through Discord's
@@ -43,18 +43,22 @@ Gateway WebSocket.
 Use the Bun runtime and the startup command:
 
 ```bash
-bun run src/index.ts
+bun --smol run src/index.ts
 ```
 
 Or build once and start the smaller bundled file:
 
 ```bash
 bun build src/index.ts --target bun --minify --outfile dist/ticket-bot.js
-bun dist/ticket-bot.js
+bun --smol dist/ticket-bot.js
 ```
 
 Configure the environment variables in the provider. Never commit a real
 `.env` file or a Discord token.
+
+`MAX_TRANSCRIPT_PAGES` defaults to 50 and is capped at 50 to keep transcript
+closures bounded on a small server. Lower it if tickets can contain a very
+large history.
 
 ## Required environment variables
 

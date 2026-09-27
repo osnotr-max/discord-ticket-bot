@@ -5,7 +5,7 @@
   "description": "Low-memory Discord ticket bot using Bun's native WebSocket and fetch APIs.",
   "type": "module",
   "scripts": {
-    "start": "bun run src/index.ts",
+    "start": "bun --smol run src/index.ts",
     "build": "bun build src/index.ts --target bun --minify --outfile dist/ticket-bot.js",
     "check": "bun build src/index.ts --target bun --outfile /tmp/ticket-bot-check.js"
   },
