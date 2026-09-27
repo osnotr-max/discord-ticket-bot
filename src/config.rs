@@ -14,6 +14,7 @@ pub struct Config {
     pub transcript_channel_id: ChannelId,
     pub max_tickets_per_user: usize,
     pub cooldown_create_secs: i64,
+    pub action_cooldown_secs: i64,
     pub max_tickets_per_guild: usize,
     pub mention_staff_on_create: bool,
     pub mention_staff_on_unclaim: bool,
@@ -23,8 +24,8 @@ impl Config {
     pub fn from_env() -> Result<Self, String> {
         dotenvy::dotenv().ok();
 
-        let token = env::var("DISCORD_TOKEN")
-            .map_err(|_| "DISCORD_TOKEN is required.".to_string())?;
+        let token =
+            env::var("DISCORD_TOKEN").map_err(|_| "DISCORD_TOKEN is required.".to_string())?;
         if token.trim().is_empty() {
             return Err("DISCORD_TOKEN must not be empty.".to_string());
         }
@@ -44,10 +45,14 @@ impl Config {
 
         let max_tickets_per_user = parse_required_usize("MAX_TICKETS_PER_USER", 3)?;
         let cooldown_create_secs = parse_required_i64("COOLDOWN_CREATE_SECS", 30)?;
+        let action_cooldown_secs = parse_required_i64("ACTION_COOLDOWN_SECS", 3)?;
         let max_tickets_per_guild = parse_required_usize("MAX_TICKETS_PER_GUILD", 50)?;
 
         if cooldown_create_secs < 0 {
             return Err("COOLDOWN_CREATE_SECS must be non-negative.".to_string());
+        }
+        if action_cooldown_secs < 0 {
+            return Err("ACTION_COOLDOWN_SECS must be non-negative.".to_string());
         }
         if max_tickets_per_user == 0 {
             return Err("MAX_TICKETS_PER_USER must be at least 1.".to_string());
@@ -65,6 +70,7 @@ impl Config {
             transcript_channel_id,
             max_tickets_per_user,
             cooldown_create_secs,
+            action_cooldown_secs,
             max_tickets_per_guild,
             mention_staff_on_create: parse_bool("MENTION_STAFF_ON_CREATE", true),
             mention_staff_on_unclaim: parse_bool("MENTION_STAFF_ON_UNCLAIM", true),
@@ -88,9 +94,9 @@ fn parse_required_id(name: &str) -> Result<u64, String> {
 
 fn parse_optional_id(name: &str) -> Result<Option<u64>, String> {
     match env::var(name) {
-        Ok(raw) if !raw.trim().is_empty() => {
-            parse_u64(&raw).map(Some).map_err(|e| format!("{name}: {e}"))
-        }
+        Ok(raw) if !raw.trim().is_empty() => parse_u64(&raw)
+            .map(Some)
+            .map_err(|e| format!("{name}: {e}")),
         _ => Ok(None),
     }
 }
