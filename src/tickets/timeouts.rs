@@ -101,6 +101,7 @@ async fn run(ctx: Context, state: State) {
 
         prune_old_ratings(&state, now);
         prune_old_rating_in_progress(&state, now);
+        prune_action_cooldowns(&state, now);
     }
 }
 
@@ -157,5 +158,19 @@ fn prune_old_rating_in_progress(state: &State, now: DateTime<Utc>) {
         .collect();
     for uid in stale {
         state.rating_in_progress.remove(&uid);
+    }
+}
+
+fn prune_action_cooldowns(state: &State, now: DateTime<Utc>) {
+    let ttl_secs = state.config.action_cooldown_secs.max(60);
+    let ttl = ChronoDuration::seconds(ttl_secs);
+    let stale: Vec<(UserId, String)> = state
+        .action_cooldowns
+        .iter()
+        .filter(|entry| now.signed_duration_since(*entry.value()) >= ttl)
+        .map(|entry| entry.key().clone())
+        .collect();
+    for key in stale {
+        state.action_cooldowns.remove(&key);
     }
 }
