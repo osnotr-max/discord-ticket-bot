@@ -20,21 +20,25 @@ The included `Dockerfile` builds and starts the bot automatically.
 1. Create a WispByte server with the **Rust** Docker image.
 2. In **GitHub Integration**, configure the repository URL and branch, then
    use **Clone and Pull**.
-3. In **Startup**, use this startup command:
+3. Wait for the **Build Linux binary** workflow on GitHub to finish. It creates
+   `dist/ticket-bot` on the `main` branch.
+4. Use **Pull** again so the generated binary is present on WispByte.
+5. In **Startup**, use this startup command:
 
    ```bash
-   cargo run --release
+   ./dist/ticket-bot
    ```
 
-4. In **Startup → Server Configuration**, add the required and optional
+6. In **Startup → Server Configuration**, add the required and optional
    environment variables listed below.
-5. Start the server and check the Console for `starting gateway...`.
+7. Start the server and check the Console for `starting gateway...`.
 
 This bot uses Discord Gateway WebSocket connections, so no HTTP port or
 `PORT` variable is required.
 
-The repository limits Rust compilation to one job and disables release LTO to
-keep CPU and RAM usage safe on small WispByte servers.
+The WispByte startup command runs a prebuilt Linux binary, so WispByte does not
+compile Rust or Serenity during every restart. The repository also limits any
+fallback Rust compilation to one job and disables release LTO.
 
 ## Required environment variables
 
