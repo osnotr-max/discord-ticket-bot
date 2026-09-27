@@ -52,6 +52,7 @@ pub struct State {
     pub ratings: Arc<DashMap<UserId, RatingPending>>,
     pub rating_in_progress: Arc<DashMap<UserId, RatingInProgress>>,
     pub cooldowns: Arc<DashMap<UserId, DateTime<Utc>>>,
+    pub action_cooldowns: Arc<DashMap<(UserId, String), DateTime<Utc>>>,
     pub timeout_started: Arc<AtomicBool>,
 }
 
@@ -67,8 +68,29 @@ impl State {
             ratings: Arc::new(DashMap::new()),
             rating_in_progress: Arc::new(DashMap::new()),
             cooldowns: Arc::new(DashMap::new()),
+            action_cooldowns: Arc::new(DashMap::new()),
             timeout_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Enforce a small per-user, per-action cooldown without delaying the
+    /// interaction response. Returns the remaining seconds when blocked.
+    pub fn action_cooldown_remaining(
+        &self,
+        user_id: UserId,
+        action: &str,
+        now: DateTime<Utc>,
+    ) -> Option<i64> {
+        let key = (user_id, action.to_string());
+        if let Some(last) = self.action_cooldowns.get(&key) {
+            let elapsed = now.signed_duration_since(*last).num_seconds();
+            let remaining = self.config.action_cooldown_secs - elapsed;
+            if remaining > 0 {
+                return Some(remaining);
+            }
+        }
+        self.action_cooldowns.insert(key, now);
+        None
     }
 
     pub async fn get(ctx: &Context) -> Option<Self> {
