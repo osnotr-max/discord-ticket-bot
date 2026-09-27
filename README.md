@@ -1,6 +1,6 @@
-# Discord Ticket Bot
+# Honey Lua Support Bot
 
-Discord ticket bot rebuilt in **TypeScript running on Bun**. It uses Bun's
+Honey Lua's Discord ticket bot is rebuilt in **TypeScript running on Bun**. It uses Bun's
 native `fetch` and `WebSocket` implementations instead of `discord.js`, so the
 production process has no npm dependencies, no message cache and no worker
 thread pool.

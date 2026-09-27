@@ -13,6 +13,8 @@
 const API = "https://discord.com/api/v10";
 const GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json";
 const DEFAULT_STAFF_ROLE_ID = "1538753673847644270";
+const BRAND = "Honey Lua";
+const SUPPORT_NAME = "Honey Lua Support";
 
 type Snowflake = string;
 type Json = Record<string, any>;
@@ -96,7 +98,7 @@ const TYPES: TicketType[] = [
   {
     typeId: "script",
     channelPrefix: "script-",
-    buttonLabel: "Problems in the script",
+    buttonLabel: "Script Support",
     emoji: "🎫",
     fields: [
       { label: "What is your executor?", style: 2, maxLength: 500, required: true },
@@ -116,7 +118,7 @@ const TYPES: TicketType[] = [
   {
     typeId: "staff_report",
     channelPrefix: "staff-report-",
-    buttonLabel: "Staff Report ticket",
+    buttonLabel: "Report a Staff Member",
     emoji: "⚠️",
     fields: [
       { label: "Which staff are you reporting to?", style: 1, maxLength: 300, required: true },
@@ -126,7 +128,7 @@ const TYPES: TicketType[] = [
   {
     typeId: "user_report",
     channelPrefix: "user-report-",
-    buttonLabel: "User report",
+    buttonLabel: "Report a User",
     emoji: "🚫",
     fields: [
       { label: "Which member is the target of the report?", style: 1, maxLength: 300, required: false },
@@ -135,15 +137,24 @@ const TYPES: TicketType[] = [
   }
 ];
 
-const PANEL_DESCRIPTION = `We have 4 options of tickets you can make
+const PANEL_DESCRIPTION = `Welcome to Honey Lua Support!
 
-Problems in the script: For reporting Bugs in the script
+Choose the option that best matches what you need. Please provide clear,
+complete answers so our team can help you faster.
 
-General support: Questions concerns suggestions. Etc
+🎫 Script Support
+Report bugs, executor issues, game problems, or script questions.
 
-User report: To report Server members that are breaking the rules.
+🎧 General Support
+Ask a question, share a suggestion, or request general assistance.
 
-Staff Report Ticket: For reporting staff members. (WARNING: Beta testers and content creators are NOT staff DO NOT use this option to report beta testers or content creators use the user report option!)`;
+⚠️ Report a Staff Member
+Use this only for a genuine staff-related report.
+
+🚫 Report a User
+Report a member who is breaking the server rules.
+
+Please do not report beta testers or content creators as staff members.`;
 
 const state = {
   tickets: new Map<Snowflake, Ticket>(),
@@ -332,7 +343,7 @@ async function followup(interaction: Interaction, content: string): Promise<void
 function modal(type: TicketType): Json {
   return {
     custom_id: `ticket_form_${type.typeId}`,
-    title: "Please answer the question below.",
+    title: `${BRAND} • ${type.buttonLabel}`.slice(0, 45),
     components: type.fields.map((field, index) => ({
       type: 1,
       components: [{
@@ -371,12 +382,12 @@ async function setupPanel(interaction: Interaction): Promise<void> {
     return;
   }
   const components = [
-    row([button("ticket_open_script", "🎫 Problems in the script", 1)]),
+    row([button("ticket_open_script", "🎫 Script Support", 1)]),
     row([button("ticket_open_general", "🎧 General Support", 1)]),
-    row([button("ticket_open_staff_report", "⚠️ Staff Report ticket", 1), button("ticket_open_user_report", "🚫 User report", 1)])
+    row([button("ticket_open_staff_report", "⚠️ Report a Staff Member", 1), button("ticket_open_user_report", "🚫 Report a User", 1)])
   ];
   await reply(interaction, "", {
-    embeds: [{ ...embed("Support", 0xf0b429, PANEL_DESCRIPTION), footer: { text: "Ticket Bot" } }],
+    embeds: [{ ...embed(`🍯 ${SUPPORT_NAME}`, 0xf0b429, PANEL_DESCRIPTION), footer: { text: `${BRAND} • Support Center` } }],
     components
   });
 }
@@ -465,7 +476,7 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
   state.tickets.set(channel.id, ticket);
   state.createCooldowns.set(ownerId, now);
 
-  await followup(interaction, `✅ Ticket created in <#${channel.id}>.`);
+  await followup(interaction, `✅ Your ${BRAND} ticket was created in <#${channel.id}>.`);
   const fields = answers.map(([name, value]) => ({
     name: truncate(name, 256),
     value: truncate(value || "—", 1024),
@@ -475,14 +486,14 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
     sendMessage(channel.id, {
       content: cfg().mentionStaffOnCreate ? staffMention() : undefined,
       embeds: [{
-        ...embed(`${type.emoji} ${type.buttonLabel}`, 0x5865f2, `Hello <@${ownerId}>, your ticket has been created. A staff member will attend you soon.`),
+        ...embed(`${type.emoji} ${BRAND} • ${type.buttonLabel}`, 0x5865f2, `Welcome <@${ownerId}>! Your Honey Lua support ticket is open. A team member will be with you as soon as possible.`),
         fields
       }],
-      components: [row([button("ticket_claim", "🔒 Claim", 2), button("ticket_close", "🔴 Close", 4)])]
+      components: [row([button("ticket_claim", "🔒 Claim Ticket", 2), button("ticket_close", "🔴 Close Ticket", 4)])]
     }),
     sendMessage(cfg().logChannelId, {
       embeds: [{
-        ...embed("🎫 Ticket created", 0x57f28a),
+        ...embed(`🎫 ${BRAND} • Ticket Created`, 0x57f28a),
         fields: [
           { name: "Type", value: type.buttonLabel, inline: true },
           { name: "Owner", value: `${ticket.ownerName} (<@${ownerId}>)`, inline: true },
@@ -490,7 +501,7 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
           { name: "Created at", value: new Date(now).toISOString(), inline: true },
           { name: "First answer", value: truncate(answers[0]?.[1] || "—", 1024), inline: false }
         ],
-        footer: { text: `guild ${cfg().guildId}` }
+        footer: { text: `${BRAND} • Guild ${cfg().guildId}` }
       }]
     })
   ]);
@@ -515,16 +526,16 @@ async function handleClaim(interaction: Interaction): Promise<void> {
   }
   const result = applyClaim(interaction.channel_id || "", interactionUserId(interaction));
   if (result === "missing") {
-    await ephemeral(interaction, "❌ Ticket not found or already closed.");
+    await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
     return;
   }
   if (result === "already") {
-    await ephemeral(interaction, "⚠️ This ticket is already claimed.");
+    await ephemeral(interaction, "⚠️ This ticket is already claimed by another team member.");
     return;
   }
-  await ephemeral(interaction, "🔒 Ticket claimed.");
+  await ephemeral(interaction, "🔒 Ticket claimed. The Honey Lua team is on it.");
   await sendMessage(interaction.channel_id!, {
-    embeds: [embed("🔒 Ticket claimed", 0xf0b429, `<@${interactionUserId(interaction)}> claimed this ticket.`)]
+    embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${interactionUserId(interaction)}> is now handling this ticket.`)]
   }).catch((error) => log("claim notice failed", error));
 }
 
@@ -578,7 +589,7 @@ function buildTranscript(ticket: Ticket, messages: string[], reason: string, clo
   const type = findType(ticket.typeId);
   const claimed = ticket.claimedBy || "—";
   const closeUser = closedBy || "system";
-  let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Transcript ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><header class="meta"><h1>Ticket Transcript</h1>`;
+  let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${BRAND} Transcript ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><header class="meta"><h1>${BRAND} Ticket Transcript</h1>`;
   html += metaRow("Ticket ID", ticket.id) + metaRow("Type", type?.buttonLabel || ticket.typeId);
   html += metaRow("Owner", `${ticket.ownerName} (${ticket.ownerId})`) + metaRow("Claimed by", claimed);
   html += metaRow("Closed by", closeUser) + metaRow("Reason", reason);
@@ -593,21 +604,21 @@ function buildTranscript(ticket: Ticket, messages: string[], reason: string, clo
   }
   html += `</section><section class="messages"><h2>Messages</h2>`;
   html += messages.length ? messages.join("") : `<p class="empty">No messages captured.</p>`;
-  return `${html}</section><footer class="foot">Generated by the ticket bot.</footer></body></html>`;
+  return `${html}</section><footer class="foot">Generated by ${BRAND} Support.</footer></body></html>`;
 }
 
 async function sendRating(ticket: Ticket, html: string): Promise<void> {
   const channel = await discordRequest(`/users/@me/channels`, { method: "POST" }, { recipient_id: ticket.ownerId });
   await sendMessage(channel.id, {
     embeds: [{
-      ...embed("⭐ Rate support", 0xf0b429, "Tap a star to rate the support you received (1 = poor, 5 = excellent). After tapping, you may add optional feedback."),
+      ...embed(`🍯 ${BRAND} • Rate Support`, 0xf0b429, "How did we do? Tap a star to rate the support you received. You can add optional feedback after choosing a rating."),
       fields: [
         { name: "Ticket", value: ticket.id, inline: true },
         { name: "Type", value: ticket.typeId, inline: true }
       ]
     }],
     components: [row([1, 2, 3, 4, 5].map((stars) => button(`rate_${stars}`, "⭐".repeat(stars), 2)))]
-  }, { name: `transcript-${ticket.id}.html`, content: html });
+  }, { name: `honey-lua-transcript-${ticket.id}.html`, content: html });
   state.ratings.set(ticket.ownerId, {
     ticketId: ticket.id,
     channelId: ticket.channelId,
@@ -625,7 +636,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
   const html = buildTranscript(ticket, messages, reason, closedBy);
   await sendMessage(cfg().transcriptChannelId, {
     embeds: [{
-      ...embed("📄 Transcript", 0x5865f2),
+      ...embed(`📄 ${BRAND} • Ticket Transcript`, 0x5865f2),
       fields: [
         { name: "Ticket", value: ticket.id, inline: true },
         { name: "Type", value: ticket.typeId, inline: true },
@@ -641,7 +652,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
   await sendRating(ticket, html).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
   await sendMessage(cfg().logChannelId, {
     embeds: [{
-      ...embed(reason === "manual" ? "🔴 Closed (manual)" : "🔴 Closed (automatic)", 0xed4245),
+      ...embed(reason === "manual" ? `🔴 ${BRAND} • Closed Manually` : `🔴 ${BRAND} • Closed Automatically`, 0xed4245),
       fields: [
         { name: "Ticket", value: ticket.id, inline: true },
         { name: "Type", value: ticket.typeId, inline: true },
@@ -653,7 +664,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
     }]
   }).catch((error) => log(`close log failed for ${ticket.id}`, error));
   await sendMessage(ticket.channelId, {
-    embeds: [embed("🗑️ Deleting", 0x95a5a6, "This channel will be deleted in 10s. The transcript is already saved.")]
+    embeds: [embed(`🗑️ ${BRAND} • Closing`, 0x95a5a6, "This channel will be deleted in 10 seconds. The transcript has already been saved.")]
   }).catch((error) => log(`countdown failed in ${ticket.channelId}`, error));
   await Bun.sleep(10000);
   await discordRequest(`/channels/${ticket.channelId}`, { method: "DELETE" }, undefined).catch((error) => log(`delete channel failed for ${ticket.channelId}`, error));
@@ -662,12 +673,12 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
 async function handleClose(interaction: Interaction): Promise<void> {
   const ticket = state.tickets.get(interaction.channel_id || "");
   if (!ticket) {
-    await ephemeral(interaction, "❌ Ticket not found or already closed.");
+    await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
     return;
   }
   const staff = hasStaffRole(interaction);
   if (!staff && interactionUserId(interaction) !== ticket.ownerId) {
-    await ephemeral(interaction, "❌ You do not have permission to close this ticket.");
+    await ephemeral(interaction, "❌ Only the ticket owner or a Honey Lua team member can close this ticket.");
     return;
   }
   await defer(interaction);
@@ -677,7 +688,7 @@ async function handleClose(interaction: Interaction): Promise<void> {
 function feedbackModal(): Json {
   return {
     custom_id: "rating_feedback",
-    title: "⭐ Optional feedback",
+    title: `${BRAND} • Optional Feedback`.slice(0, 45),
     components: [{
       type: 1,
       components: [{
@@ -706,9 +717,9 @@ function ratingLog(userId: Snowflake, stars: number, pending?: RatingPending, fe
   }
   if (feedback !== undefined) fields.push({ name: "Feedback", value: truncate(feedback || "—", 1024), inline: false });
   return {
-    ...embed(feedback === undefined ? "⭐ Rating received" : "⭐ Feedback received", 0x9b59b6),
+    ...embed(feedback === undefined ? `⭐ ${BRAND} • Rating Received` : `⭐ ${BRAND} • Feedback Received`, 0x9b59b6),
     fields,
-    footer: { text: `guild ${cfg().guildId}` }
+    footer: { text: `${BRAND} • Guild ${cfg().guildId}` }
   };
 }
 
@@ -718,7 +729,7 @@ async function handleRatingClick(interaction: Interaction, stars: number): Promi
   state.ratings.delete(userId);
   void sendMessage(cfg().logChannelId, { embeds: [ratingLog(userId, stars, pending)] }).catch((error) => log("rating log failed", error));
   if (!pending) {
-    await ephemeral(interaction, `⭐ Thank you! Rating ${stars}/5 recorded.`);
+    await ephemeral(interaction, `⭐ Thank you! Your ${BRAND} rating of ${stars}/5 was recorded.`);
     return;
   }
   state.ratingInProgress.set(userId, { ...pending, stars, createdAt: Date.now() });
@@ -730,14 +741,14 @@ async function handleFeedback(interaction: Interaction): Promise<void> {
   const progress = state.ratingInProgress.get(userId);
   state.ratingInProgress.delete(userId);
   if (!progress) {
-    await ephemeral(interaction, "⭐ Thanks!");
+    await ephemeral(interaction, `⭐ Thanks for your feedback about ${BRAND}!`);
     return;
   }
   const feedback = modalInputs(interaction).get("rating_feedback_text")?.trim() || "";
   void sendMessage(cfg().logChannelId, {
     embeds: [ratingLog(userId, progress.stars, progress, feedback)]
   }).catch((error) => log("feedback log failed", error));
-  await ephemeral(interaction, `⭐ Thank you! Rating ${progress.stars}/5 and your feedback were recorded.`);
+  await ephemeral(interaction, `⭐ Thank you! Your ${BRAND} rating and feedback were recorded.`);
 }
 
 async function handleModalSubmit(interaction: Interaction): Promise<void> {
@@ -763,7 +774,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
   const isDmRating = interaction.guild_id === undefined &&
     (customId.startsWith("rate_") || customId === "rating_feedback");
   if (interaction.guild_id !== cfg().guildId && !isDmRating) {
-    await ephemeral(interaction, "❌ This bot only operates in the configured server.").catch(() => {});
+    await ephemeral(interaction, `❌ ${BRAND} Support is only available in the configured server.`).catch(() => {});
     return;
   }
   const key = actionKey(interaction);
@@ -805,7 +816,7 @@ async function maintenance(): Promise<void> {
       ticket.reminderSent = false;
       void sendMessage(ticket.channelId, {
         content: cfg().mentionStaffOnUnclaim ? staffMention() : undefined,
-        embeds: [embed("⚠️ Claim removed", 0xed4245, "Removed due to inactivity (6h).")]
+        embeds: [embed(`⚠️ ${BRAND} • Claim Removed`, 0xed4245, "The claim was removed after 6 hours of inactivity.")]
       }).catch((error) => log(`unclaim notice failed in ${ticket.channelId}`, error));
       continue;
     }
@@ -813,7 +824,7 @@ async function maintenance(): Promise<void> {
       ticket.reminderSent = true;
       const dm = await discordRequest(`/users/@me/channels`, { method: "POST" }, { recipient_id: ticket.ownerId }).catch(() => null);
       if (dm) await sendMessage(dm.id, {
-        embeds: [embed("⏰ Ticket reminder", 0xf0b429, `Hi <@${ticket.ownerId}>, your ticket in <#${ticket.channelId}> has been open without activity for a while. If you still need help, send a message there or ping staff. If it is resolved, you can close it with the Close button.`)]
+        embeds: [embed(`⏰ ${BRAND} • Ticket Reminder`, 0xf0b429, `Hi <@${ticket.ownerId}>! Your ticket in <#${ticket.channelId}> has been open without activity for a while. If you still need help, reply in the ticket or contact the team. If it is resolved, you can close it with the button.`)]
       }).catch((error) => log(`reminder failed in ${ticket.channelId}`, error));
     }
   }
@@ -827,7 +838,7 @@ async function maintenance(): Promise<void> {
 async function registerCommand(): Promise<void> {
   await discordRequest(`/applications/${state.applicationId}/guilds/${cfg().guildId}/commands`, { method: "PUT" }, [{
     name: "setup_panel",
-    description: "Send the ticket panel (administrators only)"
+    description: `Open the ${BRAND} support panel (administrators only)`
   }]);
 }
 
@@ -872,7 +883,7 @@ async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
         if (message.member?.roles?.includes(cfg().staffRoleId) && !ticket.claimedBy) {
           applyClaim(message.channel_id, message.author.id);
           void sendMessage(message.channel_id, {
-            embeds: [embed("🔒 Ticket claimed", 0xf0b429, `<@${message.author.id}> claimed this ticket (auto-claim).`)]
+            embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${message.author.id}> started handling this ticket automatically.`)]
           }).catch((error) => log("auto-claim notice failed", error));
         }
       }
