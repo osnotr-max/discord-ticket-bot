@@ -3,6 +3,7 @@
 .git
 .gitignore
 target
+dist
 attached_assets
 .cache
 .local

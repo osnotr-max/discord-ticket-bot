@@ -1,49 +1,62 @@
-# Ticket Bot
+# Discord Ticket Bot
 
-Discord ticket bot built with Rust and Serenity.
+Discord ticket bot rebuilt in **TypeScript running on Bun**. It uses Bun's
+native `fetch` and `WebSocket` implementations instead of `discord.js`, so the
+production process has no npm dependencies, no message cache and no worker
+thread pool.
 
-## Deploy
+## Why Bun
 
-The project can run on any provider that supports Rust or Docker.
+For a 512 MB server with a weak CPU, this implementation avoids the largest
+avoidable cost in a Discord bot: a full client framework and its object cache.
+Only the Discord Gateway intents required by this bot are enabled:
 
-### Native Rust provider
+- `GUILDS`
+- `GUILD_MESSAGES`
+- `DIRECT_MESSAGES`
+- `MESSAGE_CONTENT`
 
-- Build command: `cargo build --release`
-- Start command: `./target/release/ticket-bot`
+The bot keeps ticket state in bounded in-memory maps, prunes cooldowns and
+expired ratings, uses one event loop, and builds a minified single-file
+executable script for deployment.
 
-### Docker provider
+## Run
 
-The included `Dockerfile` builds and starts the bot automatically.
+```bash
+cp .env.example .env
+# fill .env with the Discord values
+bun run src/index.ts
+```
+
+For a production build:
+
+```bash
+bun run build
+bun /path/to/dist/ticket-bot.js
+```
+
+No HTTP port or `PORT` variable is needed. The bot connects through Discord's
+Gateway WebSocket.
 
 ## WispByte
 
-1. Create a WispByte server with the **Rust** Docker image.
-2. In **GitHub Integration**, configure the repository URL and branch, then
-   use **Clone and Pull**.
-3. Wait for the **Build Linux binary** workflow on GitHub to finish. It creates
-   `dist/ticket-bot` on the `main` branch.
-4. Use **Pull** again so the generated binary is present on WispByte.
-5. In **Startup**, use this startup command:
+Use the Bun runtime and the startup command:
 
-   ```bash
-   ./dist/ticket-bot
-   ```
+```bash
+bun run src/index.ts
+```
 
-6. In **Startup → Server Configuration**, add the required and optional
-   environment variables listed below.
-7. Start the server and check the Console for `starting gateway...`.
+Or build once and start the smaller bundled file:
 
-This bot uses Discord Gateway WebSocket connections, so no HTTP port or
-`PORT` variable is required.
+```bash
+bun build src/index.ts --target bun --minify --outfile dist/ticket-bot.js
+bun dist/ticket-bot.js
+```
 
-The WispByte startup command runs a prebuilt Linux binary, so WispByte does not
-compile Rust or Serenity during every restart. The repository also limits any
-fallback Rust compilation to one job and disables release LTO.
+Configure the environment variables in the provider. Never commit a real
+`.env` file or a Discord token.
 
 ## Required environment variables
-
-Configure these as Secrets/Environment Variables in the provider. Do not
-commit a real `.env` file or a Discord token.
 
 ```env
 DISCORD_TOKEN=your_discord_bot_token
@@ -52,35 +65,11 @@ TICKET_CATEGORY_ID=your_ticket_category_id
 LOG_CHANNEL_ID=your_audit_channel_id
 ```
 
-## Optional environment variables
+`TRANSCRIPT_CHANNEL_ID` falls back to `LOG_CHANNEL_ID`.
 
-```env
-STAFF_ROLE_ID=1538753673847644270
-TRANSCRIPT_CHANNEL_ID=your_transcript_channel_id
-MAX_TICKETS_PER_USER=3
-COOLDOWN_CREATE_SECS=30
-ACTION_COOLDOWN_SECS=3
-MAX_TICKETS_PER_GUILD=50
-MENTION_STAFF_ON_CREATE=true
-MENTION_STAFF_ON_UNCLAIM=true
-RUST_LOG=info
-```
+The bot needs the Server Members intent only if another feature outside this
+repository requires it; this implementation does not request it. Enable
+**Message Content Intent** in the Discord Developer Portal.
 
-If `TRANSCRIPT_CHANNEL_ID` is omitted, transcripts use `LOG_CHANNEL_ID`.
-
-`ACTION_COOLDOWN_SECS` limits repeated interactions per user and per action.
-It defaults to 3 seconds. Interaction responses remain immediate; the bot
-does not sleep before acknowledging Discord buttons or modals.
-
-## Discord setup
-
-In the Discord Developer Portal, enable these privileged intents for the bot:
-
-- Server Members Intent
-- Message Content Intent
-
-Invite the bot to the server with the permissions required to manage ticket
-channels, send messages, embed links, attach files, and manage messages.
-
-After the provider starts the bot, use `/setup_panel` in the configured server
-to create the ticket panel.
+After startup, an administrator can use `/setup_panel` in the configured
+server.

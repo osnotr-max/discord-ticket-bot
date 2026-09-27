@@ -1,1 +1,2 @@
-modules = ["rust-stable"]
+modules = ["bun-1.3"]
+run = "bun run src/index.ts"

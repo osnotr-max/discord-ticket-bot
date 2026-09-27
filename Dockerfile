@@ -1,20 +1,11 @@
-FROM rust:1.88-bookworm AS builder
+FROM oven/bun:1.3-alpine
 
 WORKDIR /app
-
-COPY Cargo.toml Cargo.lock ./
+COPY package.json tsconfig.json ./
 COPY src ./src
 
-RUN cargo build --release
+# The runtime has no third-party dependency to install.
+RUN bun build src/index.ts --target bun --minify --outfile /usr/local/bin/ticket-bot.js
 
-FROM debian:bookworm-slim
-
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /app/target/release/ticket-bot /usr/local/bin/ticket-bot
-
-CMD ["ticket-bot"]
+ENV NODE_ENV=production
+CMD ["bun", "/usr/local/bin/ticket-bot.js"]

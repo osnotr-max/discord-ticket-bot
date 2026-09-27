@@ -1,4 +1,0 @@
-[build]
-# WispByte has a small memory limit. One rustc process avoids compilation
-# spikes while preserving the release binary's runtime behavior.
-jobs = 1
