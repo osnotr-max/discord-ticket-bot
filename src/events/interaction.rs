@@ -4,6 +4,7 @@ use serenity::model::prelude::*;
 use crate::commands::setup_panel;
 use crate::state::State;
 use crate::tickets::{claim, close, create, form, types};
+use crate::utils::now_utc;
 
 /// Central dispatcher for ALL interactions (slash, buttons, modals).
 /// Guild whitelist applied; routes by custom_id; extracts modal answers as
@@ -31,6 +32,22 @@ pub async fn handle_interaction(ctx: Context, event: InteractionCreateEvent) {
         return;
     }
 
+    if let Some(action) = action_key(&interaction) {
+        let user_id = author_id(&interaction);
+        if user_id.get() != 0 {
+            if let Some(remaining) = state.action_cooldown_remaining(user_id, &action, now_utc()) {
+                reply_ephemeral(
+                    &ctx,
+                    &interaction,
+                    &format!("⏳ Please wait {remaining}s before repeating this action."),
+                )
+                .await
+                .ok();
+                return;
+            }
+        }
+    }
+
     match &interaction.data {
         InteractionData::ApplicationCommand(data) => {
             if data.name == "setup_panel" {
@@ -51,12 +68,37 @@ pub async fn handle_interaction(ctx: Context, event: InteractionCreateEvent) {
     }
 }
 
-async fn route_component(
-    ctx: &Context,
-    state: &State,
-    interaction: &Interaction,
-    custom_id: &str,
-) {
+fn action_key(interaction: &Interaction) -> Option<String> {
+    match &interaction.data {
+        InteractionData::ApplicationCommand(data) => Some(format!("command:{}", data.name)),
+        InteractionData::MessageComponent(data) => {
+            let custom_id = data.custom_id.as_str();
+            if custom_id.starts_with("ticket_open_") {
+                Some("ticket_open".to_string())
+            } else if custom_id == "ticket_claim" {
+                Some("ticket_claim".to_string())
+            } else if custom_id == "ticket_close" {
+                Some("ticket_close".to_string())
+            } else if custom_id.starts_with("rate_") {
+                Some("rating".to_string())
+            } else {
+                None
+            }
+        }
+        InteractionData::ModalSubmit(data) => {
+            if data.custom_id == "rating_feedback" {
+                Some("rating_feedback".to_string())
+            } else if data.custom_id.starts_with("ticket_form_") {
+                Some("ticket_form".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn route_component(ctx: &Context, state: &State, interaction: &Interaction, custom_id: &str) {
     if let Some(type_id) = custom_id.strip_prefix("ticket_open_") {
         handle_open_modal(ctx, interaction, type_id).await;
         return;
@@ -139,7 +181,9 @@ async fn handle_modal_submit(
     let answers = match form::parse_submission(tt, &raw) {
         Ok(a) => a,
         Err(msg) => {
-            reply_ephemeral(ctx, interaction, &format!("❌ {msg}")).await.ok();
+            reply_ephemeral(ctx, interaction, &format!("❌ {msg}"))
+                .await
+                .ok();
             return;
         }
     };
@@ -194,7 +238,9 @@ async fn handle_claim(ctx: &Context, state: &State, interaction: &Interaction) {
     let now = claim::claim_now();
     match claim::apply_claim(state, channel_id, author_id, now) {
         claim::ClaimResult::Claimed => {
-            reply_ephemeral(ctx, interaction, "🔒 Ticket claimed.").await.ok();
+            reply_ephemeral(ctx, interaction, "🔒 Ticket claimed.")
+                .await
+                .ok();
             let bg_ctx = ctx.clone();
             tokio::spawn(async move {
                 if let Err(e) =
@@ -300,7 +346,10 @@ fn author_info(interaction: &Interaction) -> (UserId, String, String) {
         .as_ref()
         .map(|m| m.user.clone())
         .or_else(|| interaction.user.clone());
-    let id = user.as_ref().map(|u| u.id).unwrap_or_else(|| UserId::from(0u64));
+    let id = user
+        .as_ref()
+        .map(|u| u.id)
+        .unwrap_or_else(|| UserId::from(0u64));
     let username = user
         .as_ref()
         .map(|u| u.username.clone())
