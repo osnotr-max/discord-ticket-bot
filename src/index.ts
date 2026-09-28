@@ -877,12 +877,43 @@ async function fetchMessages(channelId: Snowflake): Promise<string[]> {
   return messages;
 }
 
+const TRANSCRIPT_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" });
+
 const TRANSCRIPT_CSS = `<style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;padding:24px;background:#1e1f22;color:#dbdee1;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}h1{font-size:20px;margin:0 0 16px;color:#f0b429}h2{font-size:16px;margin:0 0 12px;color:#f0b429;border-bottom:1px solid #2b2d31;padding-bottom:6px}header.meta,section.answers,section.messages{background:#2b2d31;border:1px solid #1e1f22;border-radius:8px;padding:16px;margin-bottom:16px}.row{display:flex;gap:8px;padding:3px 0;border-bottom:1px dashed #313338}.row:last-child{border:0}.k{flex:0 0 180px;color:#949ba4;font-weight:600}.v{flex:1;word-break:break-word}dt{color:#949ba4;font-weight:600;margin-top:8px}dd{margin:2px 0;word-break:break-word}.empty{color:#949ba4;font-style:italic}.msg{border-top:1px solid #1e1f22;padding:12px 0}.head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}.avatar{width:28px;height:28px;border-radius:50%;background:#313338}.author{font-weight:700;color:#f2f3f5}.uid,.ts{color:#949ba4;font-size:12px}.ts{margin-left:auto}.body{word-break:break-word}footer.foot{color:#949ba4;font-size:12px;text-align:center;margin-top:8px}
+:root{color-scheme:dark;--bg:#111214;--surface:#1b1d21;--surface-2:#23262b;--surface-3:#2b2f36;--line:#383c45;--text:#f2f3f5;--muted:#a6adba;--accent:#f0b429;--accent-2:#ffcf63;--success:#57f287;--shadow:0 18px 50px rgba(0,0,0,.28)}*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;padding:32px 20px 48px;background:radial-gradient(circle at 50% -10%,#2d2413 0,#17181b 34%,var(--bg) 70%);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}.shell{width:min(1080px,100%);margin:0 auto}a{color:var(--accent-2);text-decoration:none}a:hover{text-decoration:underline}.hero{position:relative;overflow:hidden;padding:30px;border:1px solid #5c471b;border-radius:20px;background:linear-gradient(135deg,rgba(240,180,41,.18),rgba(35,38,43,.96) 48%);box-shadow:var(--shadow);margin-bottom:20px}.hero:after{content:"";position:absolute;width:240px;height:240px;right:-100px;top:-120px;border:1px solid rgba(240,180,41,.25);border-radius:50%;box-shadow:0 0 0 24px rgba(240,180,41,.04),0 0 0 48px rgba(240,180,41,.03)}.eyebrow{color:var(--accent-2);font-size:11px;font-weight:800;letter-spacing:.13em;text-transform:uppercase}.hero-row{position:relative;z-index:1;display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.hero h1{margin:7px 0 8px;font-size:clamp(26px,4vw,42px);line-height:1.1;letter-spacing:-.03em}.hero p{max-width:700px;margin:0;color:#d5d8de;font-size:15px}.status{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;padding:8px 12px;border:1px solid rgba(87,242,135,.35);border-radius:999px;background:rgba(87,242,135,.1);color:var(--success);font-size:12px;font-weight:800}.status-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}.stats{position:relative;z-index:1;display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:26px}.stat{display:flex;align-items:center;gap:10px;padding:13px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(17,18,20,.42)}.stat-icon{font-size:18px}.stat-label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.stat-value{display:block;margin-top:2px;font-weight:750;color:var(--text)}.card{padding:22px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,var(--surface-2),var(--surface));box-shadow:0 8px 28px rgba(0,0,0,.12);margin-bottom:18px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.card-heading h2{margin:3px 0 0;color:var(--text);font-size:20px;letter-spacing:-.02em}.card-heading p{margin:4px 0 0;color:var(--muted)}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.detail{padding:12px 14px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:rgba(0,0,0,.12)}.detail-label{display:block;color:var(--muted);font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.detail-value{display:block;margin-top:3px;word-break:break-word}.answers{display:grid;gap:10px}.answer{padding:14px 16px;border-left:3px solid var(--accent);border-radius:0 10px 10px 0;background:rgba(240,180,41,.07)}.answer-label{color:var(--accent-2);font-size:12px;font-weight:800}.answer-value{margin-top:4px;white-space:pre-wrap;word-break:break-word}.timeline{position:relative;padding-left:18px}.timeline:before{content:"";position:absolute;left:3px;top:5px;bottom:5px;width:2px;background:linear-gradient(var(--accent),rgba(240,180,41,0))}.msg{position:relative;padding:0 0 22px 22px}.msg:before{content:"";position:absolute;left:-1px;top:5px;width:9px;height:9px;border:3px solid var(--surface);border-radius:50%;background:var(--accent)}.msg.bot:before{background:#7289da}.message-head{display:flex;align-items:center;gap:10px;min-height:32px}.avatar{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface-3);object-fit:cover}.identity{display:flex;align-items:center;gap:7px;min-width:0}.author{font-weight:800;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.uid{color:var(--muted);font-size:11px}.badge{padding:2px 5px;border-radius:4px;background:#5865f2;color:#fff;font-size:9px;font-weight:900;letter-spacing:.06em}.ts{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:12px}.body{margin:8px 0 0 42px;white-space:normal;word-break:break-word;color:#d9dce1}.muted,.empty{color:var(--muted);font-style:italic}.attachments,.embed-list{display:grid;gap:8px;margin:10px 0 0 42px}.attachment{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:rgba(0,0,0,.16);word-break:break-word}.attachment-icon{font-size:17px}.attachment-image{display:block;max-width:min(520px,100%);max-height:360px;margin:10px 0 0 42px;border:1px solid var(--line);border-radius:10px;object-fit:contain;background:#0b0c0e}.embed-card{padding:11px 13px;border-left:3px solid #5865f2;border-radius:0 8px 8px 0;background:rgba(88,101,242,.08)}.embed-title{font-weight:800}.embed-description{margin-top:3px;color:#d9dce1;white-space:pre-wrap}.footer{padding:22px 0 0;color:var(--muted);text-align:center;font-size:12px}.footer strong{color:var(--accent-2)}@media(max-width:720px){body{padding:18px 12px 32px}.hero{padding:22px 18px;border-radius:16px}.hero-row{display:block}.status{margin-top:18px}.stats{grid-template-columns:repeat(2,1fr)}.card{padding:17px}.detail-grid{grid-template-columns:1fr}.card-heading{display:block}.ts{width:100%;margin:3px 0 0 42px}.message-head{align-items:flex-start;flex-wrap:wrap}.body,.attachments,.embed-list,.attachment-image{margin-left:42px}}
 </style>`;
 
-function metaRow(label: string, value: string): string {
-  return `<div class="row"><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(value)}</span></div>`;
+function formatTranscriptDate(value: string | number | undefined): string {
+  const date = new Date(value || "");
+  return Number.isNaN(date.getTime()) ? "Unknown time" : TRANSCRIPT_DATE_FORMATTER.format(date);
+}
+
+function formatBytes(value: unknown): string {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function transcriptUrl(value: unknown): string {
+  const url = String(value || "");
+  return url.startsWith("https://") || url.startsWith("http://") ? url : "#";
+}
+
+function transcriptStat(icon: string, label: string, value: string): string {
+  return `<div class="stat"><span class="stat-icon">${icon}</span><div><span class="stat-label">${escapeHtml(label)}</span><span class="stat-value">${escapeHtml(value)}</span></div></div>`;
+}
+
+function transcriptDetail(label: string, value: string): string {
+  return `<div class="detail"><span class="detail-label">${escapeHtml(label)}</span><span class="detail-value">${escapeHtml(value)}</span></div>`;
+}
+
+function renderTranscriptEmbed(embedData: Json): string {
+  const title = String(embedData.title || "").trim();
+  const description = String(embedData.description || "").trim();
+  if (!title && !description) return "";
+  return `<div class="embed-card">${title ? `<div class="embed-title">${escapeHtml(title)}</div>` : ""}${description ? `<div class="embed-description">${escapeHtml(description)}</div>` : ""}</div>`;
 }
 
 function renderMessage(message: Json): string {
@@ -891,32 +922,46 @@ function renderMessage(message: Json): string {
     ? `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.png?size=64`
     : "https://cdn.discordapp.com/embed/avatars/0.png";
   const name = author.global_name || author.username || "user";
+  const timestamp = String(message.timestamp || "");
   const body = message.content?.trim()
-    ? escapeHtml(message.content).replaceAll("\n", "<br>")
-    : "📎 (no text: attachment/embed)";
-  return `<article class="msg"><div class="head"><img class="avatar" src="${escapeHtml(avatar)}" alt=""><span class="author">${escapeHtml(name)}</span><span class="uid">id ${escapeHtml(author.id || "")}</span><time class="ts">${escapeHtml(new Date(message.timestamp).toISOString())}</time></div><div class="body">${body}</div></article>`;
+    ? escapeHtml(message.content).replaceAll(String.fromCharCode(10), "<br>")
+    : "<span class=\"muted\">No text content</span>";
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  const attachmentHtml = attachments.map((attachment: Json) => {
+    const url = transcriptUrl(attachment.url || attachment.proxy_url);
+    const filename = String(attachment.filename || "Attachment");
+    const size = formatBytes(attachment.size);
+    const isImage = String(attachment.content_type || "").startsWith("image/") && url !== "#";
+    if (isImage) return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img class="attachment-image" src="${escapeHtml(url)}" alt="${escapeHtml(filename)}" loading="lazy"></a>`;
+    return `<a class="attachment" href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><span class="attachment-icon">📎</span><span>${escapeHtml(filename)}${size ? ` <span class="muted">(${escapeHtml(size)})</span>` : ""}</span></a>`;
+  }).join("");
+  const embedHtml = (Array.isArray(message.embeds) ? message.embeds : []).map(renderTranscriptEmbed).filter(Boolean).join("");
+  const botBadge = author.bot ? "<span class=\"badge\">BOT</span>" : "";
+  return `<article class="msg${author.bot ? " bot" : ""}"><div class="message-head"><img class="avatar" src="${escapeHtml(avatar)}" alt="" loading="lazy"><div class="identity"><span class="author">${escapeHtml(name)}</span>${botBadge}<span class="uid">${escapeHtml(author.id || "")}</span></div><time class="ts" datetime="${escapeHtml(timestamp)}">${escapeHtml(formatTranscriptDate(timestamp))}</time></div><div class="body">${body}</div>${attachmentHtml ? `<div class="attachments">${attachmentHtml}</div>` : ""}${embedHtml ? `<div class="embed-list">${embedHtml}</div>` : ""}</article>`;
 }
 
 function buildTranscript(ticket: Ticket, messages: string[], reason: string, closedBy?: Snowflake): string {
   const type = findType(ticket.typeId);
-  const claimed = ticket.claimedBy || "—";
-  const closeUser = closedBy || "system";
-  let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${BRAND} Transcript ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><header class="meta"><h1>${BRAND} Ticket Transcript</h1>`;
-  html += metaRow("Ticket ID", ticket.id) + metaRow("Type", type?.buttonLabel || ticket.typeId);
-  html += metaRow("Owner", `${ticket.ownerName} (${ticket.ownerId})`) + metaRow("Claimed by", claimed);
-  html += metaRow("Closed by", closeUser) + metaRow("Reason", reason);
-  html += metaRow("Created at", new Date(ticket.createdAt).toISOString()) + metaRow("Closed at", new Date().toISOString());
-  html += metaRow("Duration", formatDuration(Date.now() - ticket.createdAt)) + metaRow("Messages", String(messages.length));
-  html += `</header><section class="answers"><h2>Form answers</h2>`;
-  if (!ticket.answers.length) html += `<p class="empty">No answers recorded.</p>`;
+  const closedAt = Date.now();
+  const claimed = ticket.claimedBy || "Unclaimed";
+  const closeUser = closedBy || "System";
+  const typeLabel = type?.buttonLabel || ticket.typeId;
+  const statusLabel = reason.startsWith("automatic") ? "Closed automatically" : "Closed manually";
+  const answerCount = ticket.answers.filter(([, value]) => Boolean(value.trim())).length;
+  const duration = formatDuration(closedAt - ticket.createdAt);
+  let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${escapeHtml(BRAND)} Transcript ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><main class="shell"><header class="hero"><div class="eyebrow">${escapeHtml(BRAND)} Support · Ticket transcript</div><div class="hero-row"><div><h1>Ticket ${escapeHtml(ticket.id)}</h1><p>A complete, chronological record of the request, submitted answers and support conversation.</p></div><span class="status"><span class="status-dot"></span>${escapeHtml(statusLabel)}</span></div><div class="stats">${transcriptStat("💬", "Messages", String(messages.length))}${transcriptStat("⏱️", "Duration", duration)}${transcriptStat("📝", "Answers", String(answerCount))}${transcriptStat("✓", "Status", "Closed")}</div></header>`;
+  html += `<section class="card"><div class="card-heading"><div><div class="eyebrow">Ticket details</div><h2>Context and ownership</h2><p>These details describe how the ticket was opened and resolved.</p></div></div><div class="detail-grid">${transcriptDetail("Type", typeLabel)}${transcriptDetail("Owner", `${ticket.ownerName} (${ticket.ownerId})`)}${transcriptDetail("Claimed by", claimed)}${transcriptDetail("Closed by", closeUser)}${transcriptDetail("Reason", reason)}${transcriptDetail("Created", formatTranscriptDate(ticket.createdAt))}${transcriptDetail("Closed", formatTranscriptDate(closedAt))}${transcriptDetail("Ticket ID", ticket.id)}</div></section>`;
+  html += `<section class="card"><div class="card-heading"><div><div class="eyebrow">Intake</div><h2>Submitted answers</h2><p>The information provided when the ticket was created.</p></div></div>`;
+  if (!ticket.answers.length) html += "<p class=\"empty\">No answers were recorded for this ticket.</p>";
   else {
-    html += "<dl>";
-    for (const [label, value] of ticket.answers) html += `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value || "—")}</dd>`;
-    html += "</dl>";
+    html += "<div class=\"answers\">";
+    for (const [label, value] of ticket.answers) html += `<div class="answer"><div class="answer-label">${escapeHtml(label)}</div><div class="answer-value">${escapeHtml(value || "—")}</div></div>`;
+    html += "</div>";
   }
-  html += `</section><section class="messages"><h2>Messages</h2>`;
-  html += messages.length ? messages.join("") : `<p class="empty">No messages captured.</p>`;
-  return `${html}</section><footer class="foot">Generated by ${BRAND} Support.</footer></body></html>`;
+  html += "</section><section class=\"card\"><div class=\"card-heading\"><div><div class=\"eyebrow\">Conversation</div><h2>Message timeline</h2><p>Messages are shown in chronological order. Attachments and embeds are included when available.</p></div></div><div class=\"timeline\">";
+  html += messages.length ? messages.join("") : "<p class=\"empty\">No messages were captured before the ticket was closed.</p>";
+  html += "</div></section><footer class=\"footer\">Generated securely by <strong>" + escapeHtml(BRAND) + " Support</strong> · Ticket " + escapeHtml(ticket.id) + "</footer></main></body></html>";
+  return html;
 }
 
 function ratingButtons(ticketId: Snowflake, disabled = false): Json {
