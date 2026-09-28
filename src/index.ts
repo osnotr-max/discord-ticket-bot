@@ -1,5 +1,5 @@
 /*
- * Low-memory Osvaldo Systems Discord support service.
+ * Low-memory Staff Honey Discord support service.
  *
  * This intentionally uses only Bun/TypeScript built-ins:
  *   - native fetch for Discord REST
@@ -19,8 +19,8 @@ const STAFF_REPORT_ROLE_IDS = [
   "1539430404220518410"
 ] as const;
 const USER_REPORT_ROLE_ID = "1525161655053320385";
-const BRAND = "Osvaldo Systems";
-const SUPPORT_NAME = "Osvaldo Systems Support";
+const BRAND = "Staff Honey";
+const SUPPORT_NAME = "Staff Honey Support";
 
 type Snowflake = string;
 type Json = Record<string, any>;
@@ -161,7 +161,7 @@ const TYPES: TicketType[] = [
   }
 ];
 
-const PANEL_DESCRIPTION = `Welcome to Osvaldo Systems Support!
+const PANEL_DESCRIPTION = `Welcome to Staff Honey Support!
 
 Choose the option that best matches what you need. Please provide clear,
 complete answers so our team can help you faster.
@@ -200,6 +200,7 @@ const state = {
   closing: new Set<Snowflake>(),
   creating: new Set<string>(),
   guildRoleIds: new Set<Snowflake>(),
+  guildRolePermissions: new Map<Snowflake, bigint>(),
   guildRolesLoaded: false,
   ticketsHydrated: false,
   hydratingTickets: false
@@ -253,8 +254,8 @@ function loadConfig(): Config {
 }
 
 function log(message: string, error?: unknown): void {
-  if (error) console.error(`[osvaldo-systems] ${message}`, error);
-  else console.log(`[osvaldo-systems] ${message}`);
+  if (error) console.error(`[staff-honey] ${message}`, error);
+  else console.log(`[staff-honey] ${message}`);
 }
 
 function cfg(): Config {
@@ -265,7 +266,7 @@ function cfg(): Config {
 async function discordRequest(path: string, init: RequestInit = {}, json?: unknown): Promise<any> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bot ${cfg().token}`);
-  headers.set("User-Agent", "osvaldo-systems/1.0 (Bun)");
+  headers.set("User-Agent", "staff-honey/1.0 (Bun)");
   let body = init.body;
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
@@ -298,6 +299,19 @@ async function sendMessage(channelId: Snowflake, payload: Json, file?: { name: s
   form.append("payload_json", JSON.stringify(payload));
   form.append("files[0]", new Blob([file.content], { type: "text/html; charset=utf-8" }), file.name);
   return discordRequest(`/channels/${channelId}/messages`, { method: "POST", body: form });
+}
+
+async function sendAutoClaimNotice(channelId: Snowflake, staffId: Snowflake): Promise<void> {
+  const message = await sendMessage(channelId, {
+    embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${staffId}> started handling this ticket automatically.`)]
+  });
+  if (!message?.id) return;
+  setTimeout(() => {
+    void discordRequest(`/channels/${channelId}/messages/${message.id}`, { method: "DELETE" })
+      .catch((error) => {
+        if (!String(error).includes("Discord 404")) log(`auto-claim message deletion failed in ${channelId}`, error);
+      });
+  }, 10_000);
 }
 
 function embed(title: string, color: number, description?: string): Json {
@@ -509,7 +523,7 @@ function parseAnswers(type: TicketType, inputs: Map<string, string>): [string, s
 }
 
 function ticketTopic(type: TicketType, ownerId: Snowflake, createdAt: number): string {
-  return `osvaldo-systems:v1;type=${type.typeId};owner=${ownerId};created=${createdAt}`;
+  return `staff-honey:v1;type=${type.typeId};owner=${ownerId};created=${createdAt}`;
 }
 
 function ticketControlPayload(ticket: Ticket, mention = false): Json {
@@ -520,7 +534,7 @@ function ticketControlPayload(ticket: Ticket, mention = false): Json {
     inline: false
   }));
   const status = ticket.claimedBy
-    ? `Responsible staff member: <@${ticket.claimedBy}>.`
+    ? `Claimed by: <@${ticket.claimedBy}>.`
     : "This ticket is currently waiting for a staff member.";
   const components = ticket.claimedBy
     ? row([
@@ -558,10 +572,17 @@ async function updateTicketControlMessage(ticket: Ticket): Promise<void> {
 async function loadGuildRoles(): Promise<void> {
   try {
     const roles = await discordRequest(`/guilds/${cfg().guildId}/roles`);
-    state.guildRoleIds = new Set(Array.isArray(roles) ? roles.map((role) => role.id).filter(Boolean) : []);
+    if (!Array.isArray(roles)) throw new Error("Discord returned an invalid role list.");
+    state.guildRoleIds = new Set(roles.map((role) => role.id).filter(Boolean));
+    state.guildRolePermissions = new Map(
+      roles
+        .filter((role) => role?.id)
+        .map((role) => [role.id, BigInt(role.permissions || "0")] as [Snowflake, bigint])
+    );
     state.guildRolesLoaded = true;
   } catch (error) {
-    log("guild role discovery failed; Discord will validate role overwrites", error);
+    state.guildRolesLoaded = false;
+    log("guild role discovery failed; ticket creation is paused to prevent insecure permissions", error);
   }
 }
 
@@ -613,7 +634,7 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
   const ownerId = owner.id;
   const now = Date.now();
   if (state.hydratingTickets) {
-    await followup(interaction, "⏳ Osvaldo Systems is restoring open tickets. Please submit this form again in a moment.");
+    await followup(interaction, "⏳ Staff Honey is restoring open tickets. Please submit this form again in a moment.");
     return;
   }
   const createKey = `${ownerId}:${type.typeId}`;
@@ -621,13 +642,15 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
     await followup(interaction, "⏳ This ticket is already being created. Please wait a moment.");
     return;
   }
-  if (state.guildRolesLoaded) {
-    const missingRoles = ticketAccessRoleIds(type).filter((roleId) => !state.guildRoleIds.has(roleId));
-    if (missingRoles.length) {
-      log(`cannot create ${type.typeId} ticket; missing role IDs: ${missingRoles.join(", ")}`);
-      await followup(interaction, "❌ This report type is temporarily unavailable because a required Discord role no longer exists.");
-      return;
-    }
+  if (!state.guildRolesLoaded) {
+    await followup(interaction, "❌ This ticket type is temporarily unavailable because Discord role access could not be verified.");
+    return;
+  }
+  const missingRoles = ticketAccessRoleIds(type).filter((roleId) => !state.guildRoleIds.has(roleId));
+  if (missingRoles.length) {
+    log(`cannot create ${type.typeId} ticket; missing role IDs: ${missingRoles.join(", ")}`);
+    await followup(interaction, "❌ This report type is temporarily unavailable because a required Discord role no longer exists.");
+    return;
   }
   const lastCreated = state.createCooldowns.get(ownerId) || 0;
   if (now - lastCreated < cfg().cooldownCreateMs) {
@@ -791,13 +814,12 @@ async function handleUnclaim(interaction: Interaction): Promise<void> {
     await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
     return;
   }
-  const userId = interactionUserId(interaction);
   if (!ticket.claimedBy) {
     await ephemeral(interaction, "⚠️ This ticket is not currently claimed.");
     return;
   }
-  if (!isAdministrator(interaction) && ticket.claimedBy !== userId) {
-    await ephemeral(interaction, "❌ Only the responsible staff member or an administrator can release this ticket.");
+  if (!isAdministrator(interaction)) {
+    await ephemeral(interaction, "❌ Only administrators can release a claimed ticket.");
     return;
   }
   if (interaction.message?.id) ticket.controlMessageId = interaction.message.id;
@@ -902,7 +924,7 @@ async function sendRating(ticket: Ticket, html: string): Promise<void> {
       ]
     }],
     components: [row([1, 2, 3, 4, 5].map((stars) => button(`rate_${stars}`, "⭐".repeat(stars), 2)))]
-  }, { name: `osvaldo-systems-transcript-${ticket.id}.html`, content: html });
+  }, { name: `staff-honey-transcript-${ticket.id}.html`, content: html });
   state.ratings.set(ticket.ownerId, {
     ticketId: ticket.id,
     channelId: ticket.channelId,
@@ -1102,9 +1124,7 @@ async function maintenance(): Promise<void> {
     }
     if (ticket.claimedBy && idle >= 6 * 60 * 60 * 1000) {
       void releaseTicket(ticket).then(() => {
-        const type = findType(ticket.typeId);
         return sendMessage(ticket.channelId, {
-          content: cfg().mentionStaffOnUnclaim && type ? ticketMention(type) : undefined,
           embeds: [embed(`⚠️ ${BRAND} • Claim Removed`, 0xed4245, "The claim was removed after 6 hours of inactivity.")]
         });
       }).catch((error) => log(`unclaim failed in ${ticket.channelId}`, error));
@@ -1134,9 +1154,14 @@ function snowflakeCreatedAt(id: Snowflake): number {
 }
 
 function parseTicketTopic(topic: string | undefined): { typeId?: string; ownerId?: Snowflake; createdAt?: number } {
-  if (!topic?.startsWith("osvaldo-systems:v1;")) return {};
+  const prefix = topic?.startsWith("staff-honey:v1;")
+    ? "staff-honey:v1;"
+    : topic?.startsWith("osvaldo-systems:v1;")
+      ? "osvaldo-systems:v1;"
+      : "";
+  if (!prefix) return {};
   const values = new Map(
-    topic.slice("osvaldo-systems:v1;".length)
+    topic.slice(prefix.length)
       .split(";")
       .map((part) => part.split("="))
       .filter(([key, value]) => key && value)
@@ -1153,6 +1178,20 @@ function firstMemberOverwrite(
   predicate: (overwrite: Json) => boolean
 ): Snowflake | undefined {
   return (overwrites || []).find((overwrite) => overwrite.type === 1 && predicate(overwrite))?.id;
+}
+
+async function getGuildMember(memberId: Snowflake): Promise<Json | null | undefined> {
+  try {
+    return await discordRequest(`/guilds/${cfg().guildId}/members/${memberId}`);
+  } catch (error) {
+    if (String(error).includes("Discord 404")) return null;
+    log(`guild member lookup failed for ${memberId}; preserving the existing claim`, error);
+    return undefined;
+  }
+}
+
+function isAdministratorMember(member: Json | undefined): boolean {
+  return Array.isArray(member?.roles) && member.roles.some((roleId: Snowflake) => ((state.guildRolePermissions.get(roleId) || 0n) & 8n) === 8n);
 }
 
 async function hydrateOpenTickets(): Promise<void> {
@@ -1173,13 +1212,20 @@ async function hydrateOpenTickets(): Promise<void> {
         log(`skipping ticket channel ${channel.id}; owner could not be recovered`);
         continue;
       }
-      const claimedBy = firstMemberOverwrite(
+      let claimedBy = firstMemberOverwrite(
         channel.permission_overwrites,
         (overwrite) =>
           overwrite.id !== state.botId &&
           overwrite.id !== ownerId &&
           (Number(overwrite.allow || 0) & PERMISSIONS.SEND_MESSAGES) !== 0
       );
+      if (claimedBy) {
+        const member = await getGuildMember(claimedBy);
+        if (member === null || (member && state.guildRolesLoaded && !isAdministratorMember(member) && !hasAnyRole(member.roles, ticketAccessRoleIds(type)))) {
+          log(`removing stale claim from ${channel.id}; claimer is no longer an eligible member`);
+          claimedBy = undefined;
+        }
+      }
       const lastActivity = channel.last_message_id
         ? snowflakeCreatedAt(channel.last_message_id)
         : topic.createdAt || snowflakeCreatedAt(channel.id);
@@ -1245,7 +1291,8 @@ async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
     log(`connected as ${payload.d.user.username}`);
     if (!state.ticketsHydrated && !state.hydratingTickets) {
       state.hydratingTickets = true;
-      await Promise.allSettled([loadGuildRoles(), hydrateOpenTickets()]);
+      await loadGuildRoles();
+      await hydrateOpenTickets();
       state.hydratingTickets = false;
       state.ticketsHydrated = true;
     }
@@ -1264,9 +1311,7 @@ async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
           hasAnyRole(message.member?.roles, ticketAccessRoleIds(type)) &&
           !ticket.claimedBy
         ) {
-          void claimTicket(ticket, message.author.id).then(() => sendMessage(message.channel_id, {
-            embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${message.author.id}> started handling this ticket automatically.`)]
-          })).catch((error) => log("auto-claim failed", error));
+          void claimTicket(ticket, message.author.id).then(() => sendAutoClaimNotice(message.channel_id, message.author.id)).catch((error) => log("auto-claim failed", error));
         }
       }
     }
@@ -1313,7 +1358,7 @@ async function handleGateway(payload: GatewayPayload): Promise<void> {
       gatewaySend(2, {
         token: cfg().token,
         intents: 1 | 512 | 4096 | 32768,
-        properties: { os: "linux", browser: "osvaldo-systems", device: "osvaldo-systems" }
+        properties: { os: "linux", browser: "staff-honey", device: "staff-honey" }
       });
     }
     return;
