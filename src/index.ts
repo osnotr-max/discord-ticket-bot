@@ -698,7 +698,7 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
       { name: "Type", value: type.buttonLabel, inline: true },
       { name: "Owner", value: `${ticket.ownerName} (<@${ownerId}>)`, inline: true },
       { name: "Channel", value: `<#${channel.id}>`, inline: true },
-      { name: "Created at", value: new Date(now).toISOString(), inline: true },
+      { name: "Created at", value: discordTimestamp(now), inline: true },
       { name: "First answer", value: truncate(answers[0]?.[1] || "—", 1024), inline: false }
     ];
     const controlMessage = sendMessage(
@@ -845,6 +845,10 @@ async function handleUnclaim(interaction: Interaction): Promise<void> {
   }).catch((error) => log(`release notice failed in ${ticket.channelId}`, error));
 }
 
+function discordTimestamp(milliseconds: number, style: "t" | "T" | "d" | "D" | "f" | "F" | "R" = "F"): string {
+  return `<t:${Math.floor(milliseconds / 1000)}:${style}>`;
+}
+
 function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000);
   if (minutes < 1) return "<1m";
@@ -968,7 +972,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
           { name: "Owner", value: `${ticket.ownerName} (<@${ticket.ownerId}>)`, inline: true },
           { name: "Closed by", value: closedBy ? `<@${closedBy}>` : "system (timeout)", inline: true },
           { name: "Messages", value: String(messages.length), inline: true },
-          { name: "Closed at", value: new Date().toISOString(), inline: true }
+          { name: "Closed at", value: discordTimestamp(Date.now()), inline: true }
         ]
       }]
     }).catch((error) => log(`close log failed for ${ticket.id}`, error));
