@@ -1,5 +1,5 @@
 /*
- * Low-memory Staff Honey Discord support service.
+ * Low-memory Honeylua Discord support service.
  *
  * This intentionally uses only Bun/TypeScript built-ins:
  *   - native fetch for Discord REST
@@ -19,8 +19,8 @@ const STAFF_REPORT_ROLE_IDS = [
   "1539430404220518410"
 ] as const;
 const USER_REPORT_ROLE_ID = "1525161655053320385";
-const BRAND = "Staff Honey";
-const SUPPORT_NAME = "Staff Honey Support";
+const BRAND = "Honeylua";
+const SUPPORT_NAME = "Honeylua Support";
 
 type Snowflake = string;
 type Json = Record<string, any>;
@@ -161,7 +161,7 @@ const TYPES: TicketType[] = [
   }
 ];
 
-const PANEL_DESCRIPTION = `Welcome to Staff Honey Support!
+const PANEL_DESCRIPTION = `Welcome to Honeylua Support!
 
 Choose the option that best matches what you need. Please provide clear,
 complete answers so our team can help you faster.
@@ -254,8 +254,8 @@ function loadConfig(): Config {
 }
 
 function log(message: string, error?: unknown): void {
-  if (error) console.error(`[staff-honey] ${message}`, error);
-  else console.log(`[staff-honey] ${message}`);
+  if (error) console.error(`[honeylua] ${message}`, error);
+  else console.log(`[honeylua] ${message}`);
 }
 
 function cfg(): Config {
@@ -266,7 +266,7 @@ function cfg(): Config {
 async function discordRequest(path: string, init: RequestInit = {}, json?: unknown): Promise<any> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bot ${cfg().token}`);
-  headers.set("User-Agent", "staff-honey/1.0 (Bun)");
+  headers.set("User-Agent", "honeylua/1.0 (Bun)");
   let body = init.body;
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
@@ -523,7 +523,7 @@ function parseAnswers(type: TicketType, inputs: Map<string, string>): [string, s
 }
 
 function ticketTopic(type: TicketType, ownerId: Snowflake, createdAt: number): string {
-  return `staff-honey:v1;type=${type.typeId};owner=${ownerId};created=${createdAt}`;
+  return `honeylua:v1;type=${type.typeId};owner=${ownerId};created=${createdAt}`;
 }
 
 function ticketControlPayload(ticket: Ticket, mention = false): Json {
@@ -634,7 +634,7 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
   const ownerId = owner.id;
   const now = Date.now();
   if (state.hydratingTickets) {
-    await followup(interaction, "⏳ Staff Honey is restoring open tickets. Please submit this form again in a moment.");
+    await followup(interaction, "⏳ Honeylua is restoring open tickets. Please submit this form again in a moment.");
     return;
   }
   const createKey = `${ownerId}:${type.typeId}`;
@@ -924,7 +924,7 @@ async function sendRating(ticket: Ticket, html: string): Promise<void> {
       ]
     }],
     components: [row([1, 2, 3, 4, 5].map((stars) => button(`rate_${stars}`, "⭐".repeat(stars), 2)))]
-  }, { name: `staff-honey-transcript-${ticket.id}.html`, content: html });
+  }, { name: `honeylua-transcript-${ticket.id}.html`, content: html });
   state.ratings.set(ticket.ownerId, {
     ticketId: ticket.id,
     channelId: ticket.channelId,
@@ -1154,8 +1154,8 @@ function snowflakeCreatedAt(id: Snowflake): number {
 }
 
 function parseTicketTopic(topic: string | undefined): { typeId?: string; ownerId?: Snowflake; createdAt?: number } {
-  const prefix = topic?.startsWith("staff-honey:v1;")
-    ? "staff-honey:v1;"
+  const prefix = topic?.startsWith("honeylua:v1;")
+    ? "honeylua:v1;"
     : topic?.startsWith("osvaldo-systems:v1;")
       ? "osvaldo-systems:v1;"
       : "";
@@ -1358,7 +1358,7 @@ async function handleGateway(payload: GatewayPayload): Promise<void> {
       gatewaySend(2, {
         token: cfg().token,
         intents: 1 | 512 | 4096 | 32768,
-        properties: { os: "linux", browser: "staff-honey", device: "staff-honey" }
+        properties: { os: "linux", browser: "honeylua", device: "honeylua" }
       });
     }
     return;
