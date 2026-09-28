@@ -1,6 +1,6 @@
-# Staff Honey Support
+# Honeylua Support
 
-Staff Honey' Discord support service is built in **TypeScript running on Bun**. It uses Bun's
+Honeylua' Discord support service is built in **TypeScript running on Bun**. It uses Bun's
 native `fetch` and `WebSocket` implementations instead of `discord.js`, so the
 production process has no npm dependencies, no message cache and no worker
 thread pool.
@@ -32,7 +32,7 @@ For a production build:
 
 ```bash
 bun run build
-bun --smol /path/to/dist/staff-honey.js
+bun --smol /path/to/dist/honeylua.js
 ```
 
 No HTTP port or `PORT` variable is needed. The bot connects through Discord's
@@ -49,8 +49,8 @@ bun --smol run src/index.ts
 Or build once and start the smaller bundled file:
 
 ```bash
-bun build src/index.ts --target bun --minify --outfile dist/staff-honey.js
-bun --smol dist/staff-honey.js
+bun build src/index.ts --target bun --minify --outfile dist/honeylua.js
+bun --smol dist/honeylua.js
 ```
 
 Configure the environment variables in the provider. Never commit a real
