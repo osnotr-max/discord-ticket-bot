@@ -1,5 +1,5 @@
 /*
- * Low-memory Discord ticket bot.
+ * Low-memory Osvaldo Systems Discord support service.
  *
  * This intentionally uses only Bun/TypeScript built-ins:
  *   - native fetch for Discord REST
@@ -13,11 +13,27 @@
 const API = "https://discord.com/api/v10";
 const GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json";
 const DEFAULT_STAFF_ROLE_ID = "1538753673847644270";
-const BRAND = "Honey Lua";
-const SUPPORT_NAME = "Honey Lua Support";
+const STAFF_REPORT_ROLE_IDS = [
+  "1525161651987284249",
+  "1531344415396991028",
+  "1539430404220518410"
+] as const;
+const USER_REPORT_ROLE_ID = "1525161655053320385";
+const BRAND = "Osvaldo Systems";
+const SUPPORT_NAME = "Osvaldo Systems Support";
 
 type Snowflake = string;
 type Json = Record<string, any>;
+
+const PERMISSIONS = {
+  VIEW_CHANNEL: 1024,
+  SEND_MESSAGES: 2048,
+  MANAGE_CHANNELS: 16,
+  MANAGE_MESSAGES: 8192,
+  EMBED_LINKS: 16384,
+  ATTACH_FILES: 32768,
+  READ_MESSAGE_HISTORY: 65536
+} as const;
 
 interface Config {
   token: string;
@@ -45,6 +61,7 @@ interface Ticket {
   createdAt: number;
   claimedBy?: Snowflake;
   claimedAt?: number;
+  controlMessageId?: Snowflake;
   lastActivity: number;
   reminderSent: boolean;
 }
@@ -69,6 +86,7 @@ interface Interaction {
   channel_id?: Snowflake;
   user?: Json;
   member?: Json;
+  message?: Json;
   data?: Json;
 }
 
@@ -92,6 +110,8 @@ interface TicketType {
   buttonLabel: string;
   emoji: string;
   fields: TicketField[];
+  accessRoleIds?: Snowflake[];
+  mentionRoleIds?: Snowflake[];
 }
 
 const TYPES: TicketType[] = [
@@ -120,6 +140,8 @@ const TYPES: TicketType[] = [
     channelPrefix: "staff-report-",
     buttonLabel: "Report a Staff Member",
     emoji: "⚠️",
+    accessRoleIds: [...STAFF_REPORT_ROLE_IDS],
+    mentionRoleIds: [...STAFF_REPORT_ROLE_IDS],
     fields: [
       { label: "Which staff are you reporting to?", style: 1, maxLength: 300, required: true },
       { label: "Reason for report", style: 2, maxLength: 500, required: true }
@@ -130,6 +152,8 @@ const TYPES: TicketType[] = [
     channelPrefix: "user-report-",
     buttonLabel: "Report a User",
     emoji: "🚫",
+    accessRoleIds: [USER_REPORT_ROLE_ID],
+    mentionRoleIds: [USER_REPORT_ROLE_ID],
     fields: [
       { label: "Which member is the target of the report?", style: 1, maxLength: 300, required: false },
       { label: "What did he do?", style: 2, maxLength: 500, required: false }
@@ -137,7 +161,7 @@ const TYPES: TicketType[] = [
   }
 ];
 
-const PANEL_DESCRIPTION = `Welcome to Honey Lua Support!
+const PANEL_DESCRIPTION = `Welcome to Osvaldo Systems Support!
 
 Choose the option that best matches what you need. Please provide clear,
 complete answers so our team can help you faster.
@@ -171,7 +195,14 @@ const state = {
   sequence: null as number | null,
   reconnecting: false,
   heartbeat: null as ReturnType<typeof setInterval> | null,
-  heartbeatAck: true
+  heartbeatAck: true,
+  claiming: new Set<Snowflake>(),
+  closing: new Set<Snowflake>(),
+  creating: new Set<string>(),
+  guildRoleIds: new Set<Snowflake>(),
+  guildRolesLoaded: false,
+  ticketsHydrated: false,
+  hydratingTickets: false
 };
 
 function requiredEnv(name: string): string {
@@ -222,8 +253,8 @@ function loadConfig(): Config {
 }
 
 function log(message: string, error?: unknown): void {
-  if (error) console.error(`[ticket-bot] ${message}`, error);
-  else console.log(`[ticket-bot] ${message}`);
+  if (error) console.error(`[osvaldo-systems] ${message}`, error);
+  else console.log(`[osvaldo-systems] ${message}`);
 }
 
 function cfg(): Config {
@@ -234,18 +265,31 @@ function cfg(): Config {
 async function discordRequest(path: string, init: RequestInit = {}, json?: unknown): Promise<any> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bot ${cfg().token}`);
-  headers.set("User-Agent", "discord-ticket-bot/1.0 (Bun)");
+  headers.set("User-Agent", "osvaldo-systems/1.0 (Bun)");
   let body = init.body;
   if (json !== undefined) {
     headers.set("Content-Type", "application/json");
     body = JSON.stringify(json);
   }
-  const response = await fetch(`${API}${path}`, { ...init, headers, body });
-  if (!response.ok) {
+  for (let attempt = 0; attempt <= 2; attempt++) {
+    const response = await fetch(`${API}${path}`, { ...init, headers, body });
+    if (response.ok) return response.status === 204 ? null : response.json();
+
     const text = await response.text();
+    if (response.status === 429 && attempt < 2) {
+      let retryAfter = Number(response.headers.get("Retry-After") || "0");
+      try {
+        const details = JSON.parse(text);
+        retryAfter = Number(details.retry_after || retryAfter);
+      } catch {
+        // The header is enough when Discord returns a non-JSON rate-limit body.
+      }
+      await Bun.sleep(Math.min(15_000, Math.max(250, Math.ceil(retryAfter * 1000))));
+      continue;
+    }
     throw new Error(`Discord ${response.status} ${path}: ${text.slice(0, 500)}`);
   }
-  return response.status === 204 ? null : response.json();
+  throw new Error(`Discord request exhausted retries: ${path}`);
 }
 
 async function sendMessage(channelId: Snowflake, payload: Json, file?: { name: string; content: string }): Promise<Json> {
@@ -262,20 +306,32 @@ function embed(title: string, color: number, description?: string): Json {
   return result;
 }
 
-function button(customId: string, label: string, style: number): Json {
-  return { type: 2, custom_id: customId, label, style };
+function button(customId: string, label: string, style: number, disabled = false): Json {
+  return { type: 2, custom_id: customId, label, style, ...(disabled ? { disabled: true } : {}) };
 }
 
 function row(components: Json[]): Json {
   return { type: 1, components };
 }
 
-function staffMention(): string {
-  return `<@&${cfg().staffRoleId}>`;
+function roleMention(roleIds: Snowflake[]): string {
+  return roleIds.map((id) => `<@&${id}>`).join(" ");
+}
+
+function ticketAccessRoleIds(type: TicketType): Snowflake[] {
+  return type.accessRoleIds?.length ? type.accessRoleIds : [cfg().staffRoleId];
+}
+
+function ticketMention(type: TicketType): string {
+  return roleMention(type.mentionRoleIds?.length ? type.mentionRoleIds : [cfg().staffRoleId]);
 }
 
 function findType(typeId: string): TicketType | undefined {
   return TYPES.find((type) => type.typeId === typeId);
+}
+
+function ticketTypeFromChannelName(name: string): TicketType | undefined {
+  return TYPES.find((type) => name.startsWith(type.channelPrefix));
 }
 
 function sanitizeChannelName(raw: string): string {
@@ -311,13 +367,89 @@ function interactionUserId(interaction: Interaction): Snowflake {
   return interactionUser(interaction).id || "0";
 }
 
-function hasStaffRole(interaction: Interaction): boolean {
-  return Array.isArray(interaction.member?.roles) && interaction.member.roles.includes(cfg().staffRoleId);
+function hasAnyRole(roles: unknown, allowedRoleIds: Snowflake[]): boolean {
+  return Array.isArray(roles) && allowedRoleIds.some((roleId) => roles.includes(roleId));
+}
+
+function hasTicketStaffAccess(interaction: Interaction, ticket: Ticket): boolean {
+  const type = findType(ticket.typeId);
+  return Boolean(type && hasAnyRole(interaction.member?.roles, ticketAccessRoleIds(type)));
+}
+
+function canInteractWithTicket(interaction: Interaction, ticket: Ticket): boolean {
+  const userId = interactionUserId(interaction);
+  if (isAdministrator(interaction) || userId === ticket.ownerId) return true;
+  if (ticket.claimedBy) return ticket.claimedBy === userId;
+  return hasTicketStaffAccess(interaction, ticket);
 }
 
 function isAdministrator(interaction: Interaction): boolean {
-  const permissions = BigInt(interaction.member?.permissions || "0");
-  return (permissions & 8n) === 8n;
+  try {
+    const permissions = BigInt(interaction.member?.permissions || "0");
+    return (permissions & 8n) === 8n;
+  } catch {
+    return false;
+  }
+}
+
+function permissionOverwrite(
+  id: Snowflake,
+  type: 0 | 1,
+  allow = 0,
+  deny = 0
+): Json {
+  return { id, type, allow: String(allow), deny: String(deny) };
+}
+
+function ticketPermissionOverwrites(ticket: Ticket, claimedBy?: Snowflake): Json[] {
+  const type = findType(ticket.typeId);
+  const view = PERMISSIONS.VIEW_CHANNEL;
+  const memberAccess = view | PERMISSIONS.SEND_MESSAGES | PERMISSIONS.READ_MESSAGE_HISTORY;
+  const staffAccess = memberAccess | PERMISSIONS.MANAGE_MESSAGES;
+  const botAccess = staffAccess |
+    PERMISSIONS.MANAGE_CHANNELS |
+    PERMISSIONS.EMBED_LINKS |
+    PERMISSIONS.ATTACH_FILES;
+  const overwrites: Json[] = [
+    permissionOverwrite(cfg().guildId, 0, 0, view),
+    permissionOverwrite(ticket.ownerId, 1, memberAccess, 0)
+  ];
+
+  if (claimedBy) {
+    overwrites.push(permissionOverwrite(claimedBy, 1, staffAccess, 0));
+  } else {
+    for (const roleId of ticketAccessRoleIds(type || TYPES[0])) {
+      overwrites.push(permissionOverwrite(roleId, 0, staffAccess, 0));
+    }
+  }
+  overwrites.push(permissionOverwrite(state.botId, 1, botAccess, 0));
+  return overwrites;
+}
+
+function normalizedOverwrites(overwrites: Json[] | undefined): string[] {
+  return (overwrites || [])
+    .map((item) => `${item.id}:${item.type}:${item.allow || "0"}:${item.deny || "0"}`)
+    .sort();
+}
+
+function overwritesEqual(left: Json[] | undefined, right: Json[]): boolean {
+  const current = normalizedOverwrites(left);
+  const expected = normalizedOverwrites(right);
+  return current.length === expected.length && current.every((value, index) => value === expected[index]);
+}
+
+async function synchronizeTicketPermissions(ticket: Ticket, currentOverwrites?: Json[]): Promise<boolean> {
+  const expected = ticketPermissionOverwrites(ticket, ticket.claimedBy);
+  let current = currentOverwrites;
+  if (!current) {
+    const channel = await discordRequest(`/channels/${ticket.channelId}`);
+    current = channel?.permission_overwrites;
+  }
+  if (overwritesEqual(current, expected)) return false;
+  await discordRequest(`/channels/${ticket.channelId}`, { method: "PATCH" }, {
+    permission_overwrites: expected
+  });
+  return true;
 }
 
 async function interactionCallback(interaction: Interaction, type: number, data?: Json): Promise<void> {
@@ -376,6 +508,63 @@ function parseAnswers(type: TicketType, inputs: Map<string, string>): [string, s
   });
 }
 
+function ticketTopic(type: TicketType, ownerId: Snowflake, createdAt: number): string {
+  return `osvaldo-systems:v1;type=${type.typeId};owner=${ownerId};created=${createdAt}`;
+}
+
+function ticketControlPayload(ticket: Ticket, mention = false): Json {
+  const type = findType(ticket.typeId) || TYPES[0];
+  const fields = ticket.answers.map(([name, value]) => ({
+    name: truncate(name, 256),
+    value: truncate(value || "—", 1024),
+    inline: false
+  }));
+  const status = ticket.claimedBy
+    ? `Responsible staff member: <@${ticket.claimedBy}>.`
+    : "This ticket is currently waiting for a staff member.";
+  const components = ticket.claimedBy
+    ? row([
+      button("ticket_claim", "🔒 Claimed", 2, true),
+      button("ticket_unclaim", "↩️ Release Ticket", 1),
+      button("ticket_close", "🔴 Close Ticket", 4)
+    ])
+    : row([
+      button("ticket_claim", "🔒 Claim Ticket", 2),
+      button("ticket_close", "🔴 Close Ticket", 4)
+    ]);
+  return {
+    content: mention ? ticketMention(type) : undefined,
+    embeds: [{
+      ...embed(
+        `${type.emoji} ${BRAND} • ${type.buttonLabel}`,
+        0x5865f2,
+        `Welcome <@${ticket.ownerId}>! Your ${BRAND} support ticket is open. ${status}`
+      ),
+      fields
+    }],
+    components: [components]
+  };
+}
+
+async function updateTicketControlMessage(ticket: Ticket): Promise<void> {
+  if (!ticket.controlMessageId) return;
+  await discordRequest(
+    `/channels/${ticket.channelId}/messages/${ticket.controlMessageId}`,
+    { method: "PATCH" },
+    ticketControlPayload(ticket)
+  );
+}
+
+async function loadGuildRoles(): Promise<void> {
+  try {
+    const roles = await discordRequest(`/guilds/${cfg().guildId}/roles`);
+    state.guildRoleIds = new Set(Array.isArray(roles) ? roles.map((role) => role.id).filter(Boolean) : []);
+    state.guildRolesLoaded = true;
+  } catch (error) {
+    log("guild role discovery failed; Discord will validate role overwrites", error);
+  }
+}
+
 async function setupPanel(interaction: Interaction): Promise<void> {
   if (!isAdministrator(interaction)) {
     await ephemeral(interaction, "❌ Only administrators can use this command.");
@@ -398,6 +587,7 @@ function actionKey(interaction: Interaction): string | undefined {
   if (interaction.type === 3) {
     if (customId.startsWith("ticket_open_")) return "ticket_open";
     if (customId === "ticket_claim") return "ticket_claim";
+    if (customId === "ticket_unclaim") return "ticket_unclaim";
     if (customId === "ticket_close") return "ticket_close";
     if (customId.startsWith("rate_")) return "rating";
   }
@@ -422,6 +612,23 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
   const owner = interactionUser(interaction);
   const ownerId = owner.id;
   const now = Date.now();
+  if (state.hydratingTickets) {
+    await followup(interaction, "⏳ Osvaldo Systems is restoring open tickets. Please submit this form again in a moment.");
+    return;
+  }
+  const createKey = `${ownerId}:${type.typeId}`;
+  if (state.creating.has(createKey)) {
+    await followup(interaction, "⏳ This ticket is already being created. Please wait a moment.");
+    return;
+  }
+  if (state.guildRolesLoaded) {
+    const missingRoles = ticketAccessRoleIds(type).filter((roleId) => !state.guildRoleIds.has(roleId));
+    if (missingRoles.length) {
+      log(`cannot create ${type.typeId} ticket; missing role IDs: ${missingRoles.join(", ")}`);
+      await followup(interaction, "❌ This report type is temporarily unavailable because a required Discord role no longer exists.");
+      return;
+    }
+  }
   const lastCreated = state.createCooldowns.get(ownerId) || 0;
   if (now - lastCreated < cfg().cooldownCreateMs) {
     await followup(interaction, `⏳ Please wait ${Math.ceil((cfg().cooldownCreateMs - (now - lastCreated)) / 1000)}s before creating another ticket.`);
@@ -438,105 +645,182 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
     return;
   }
 
-  const botId = state.botId;
-  const view = 1024;
-  const send = 2048;
-  const history = 65536;
-  const manageMessages = 8192;
-  const manageChannels = 16;
-  const embedLinks = 16384;
-  const attachFiles = 32768;
-  const everyoneDeny = String(view);
-  const memberAllow = String(view + send + history);
-  const staffAllow = String(view + send + history + manageMessages);
-  const botAllow = String(view + send + history + manageMessages + manageChannels + embedLinks + attachFiles);
-  const channel = await discordRequest(`/guilds/${cfg().guildId}/channels`, { method: "POST" }, {
-    name: `${type.channelPrefix}${sanitizeChannelName(owner.username || "user")}`,
-    type: 0,
-    parent_id: cfg().ticketCategoryId,
-    permission_overwrites: [
-      { id: cfg().guildId, type: 0, deny: everyoneDeny },
-      { id: ownerId, type: 1, allow: memberAllow },
-      { id: cfg().staffRoleId, type: 0, allow: staffAllow },
-      { id: botId, type: 1, allow: botAllow }
-    ]
-  });
+  state.creating.add(createKey);
+  try {
+    const draft: Ticket = {
+      id: "",
+      typeId: type.typeId,
+      channelId: "",
+      ownerId,
+      ownerName: displayName(interaction.member, owner),
+      answers,
+      createdAt: now,
+      lastActivity: now,
+      reminderSent: false
+    };
+    const channel = await discordRequest(`/guilds/${cfg().guildId}/channels`, { method: "POST" }, {
+      name: `${type.channelPrefix}${sanitizeChannelName(owner.username || "user")}`,
+      type: 0,
+      parent_id: cfg().ticketCategoryId,
+      topic: ticketTopic(type, ownerId, now),
+      permission_overwrites: ticketPermissionOverwrites(draft)
+    });
 
-  const ticket: Ticket = {
-    id: channel.id,
-    typeId: type.typeId,
-    channelId: channel.id,
-    ownerId,
-    ownerName: displayName(interaction.member, owner),
-    answers,
-    createdAt: now,
-    lastActivity: now,
-    reminderSent: false
-  };
-  state.tickets.set(channel.id, ticket);
-  state.createCooldowns.set(ownerId, now);
+    const ticket: Ticket = { ...draft, id: channel.id, channelId: channel.id };
+    state.tickets.set(channel.id, ticket);
+    state.createCooldowns.set(ownerId, now);
 
-  await followup(interaction, `✅ Your ${BRAND} ticket was created in <#${channel.id}>.`);
-  const fields = answers.map(([name, value]) => ({
-    name: truncate(name, 256),
-    value: truncate(value || "—", 1024),
-    inline: false
-  }));
-  await Promise.allSettled([
-    sendMessage(channel.id, {
-      content: cfg().mentionStaffOnCreate ? staffMention() : undefined,
-      embeds: [{
-        ...embed(`${type.emoji} ${BRAND} • ${type.buttonLabel}`, 0x5865f2, `Welcome <@${ownerId}>! Your Honey Lua support ticket is open. A team member will be with you as soon as possible.`),
-        fields
-      }],
-      components: [row([button("ticket_claim", "🔒 Claim Ticket", 2), button("ticket_close", "🔴 Close Ticket", 4)])]
-    }),
-    sendMessage(cfg().logChannelId, {
-      embeds: [{
-        ...embed(`🎫 ${BRAND} • Ticket Created`, 0x57f28a),
-        fields: [
-          { name: "Type", value: type.buttonLabel, inline: true },
-          { name: "Owner", value: `${ticket.ownerName} (<@${ownerId}>)`, inline: true },
-          { name: "Channel", value: `<#${channel.id}>`, inline: true },
-          { name: "Created at", value: new Date(now).toISOString(), inline: true },
-          { name: "First answer", value: truncate(answers[0]?.[1] || "—", 1024), inline: false }
-        ],
-        footer: { text: `${BRAND} • Guild ${cfg().guildId}` }
-      }]
-    })
-  ]);
+    await followup(interaction, `✅ Your ${BRAND} ticket was created in <#${channel.id}>.`);
+    const logFields = [
+      { name: "Type", value: type.buttonLabel, inline: true },
+      { name: "Owner", value: `${ticket.ownerName} (<@${ownerId}>)`, inline: true },
+      { name: "Channel", value: `<#${channel.id}>`, inline: true },
+      { name: "Created at", value: new Date(now).toISOString(), inline: true },
+      { name: "First answer", value: truncate(answers[0]?.[1] || "—", 1024), inline: false }
+    ];
+    const controlMessage = sendMessage(
+      channel.id,
+      ticketControlPayload(ticket, Boolean(type.mentionRoleIds?.length || cfg().mentionStaffOnCreate))
+    ).then((message) => {
+      ticket.controlMessageId = message?.id;
+      return message;
+    });
+    await Promise.allSettled([
+      controlMessage,
+      sendMessage(cfg().logChannelId, {
+        embeds: [{
+          ...embed(`🎫 ${BRAND} • Ticket Created`, 0x57f28a),
+          fields: logFields,
+          footer: { text: `${BRAND} • Guild ${cfg().guildId}` }
+        }]
+      })
+    ]);
+  } finally {
+    state.creating.delete(createKey);
+  }
 }
 
-function applyClaim(channelId: Snowflake, staffId: Snowflake): "claimed" | "already" | "missing" {
-  const ticket = state.tickets.get(channelId);
-  if (!ticket) return "missing";
-  const now = Date.now();
-  ticket.lastActivity = now;
-  ticket.reminderSent = false;
-  if (ticket.claimedBy) return "already";
+async function claimTicket(ticket: Ticket, staffId: Snowflake): Promise<"claimed" | "already" | "missing"> {
+  if (!state.tickets.has(ticket.channelId)) return "missing";
+  if (ticket.claimedBy || state.claiming.has(ticket.channelId)) return "already";
+  state.claiming.add(ticket.channelId);
+  const previousClaim = ticket.claimedBy;
+  const previousClaimedAt = ticket.claimedAt;
   ticket.claimedBy = staffId;
-  ticket.claimedAt = now;
+  ticket.claimedAt = Date.now();
+  ticket.lastActivity = Date.now();
+  ticket.reminderSent = false;
+  try {
+    await synchronizeTicketPermissions(ticket);
+  } catch (error) {
+    ticket.claimedBy = previousClaim;
+    ticket.claimedAt = previousClaimedAt;
+    log(`claim permissions failed in ${ticket.channelId}`, error);
+    throw error;
+  } finally {
+    state.claiming.delete(ticket.channelId);
+  }
+  await updateTicketControlMessage(ticket).catch((error) => log(`claim UI update failed in ${ticket.channelId}`, error));
   return "claimed";
 }
 
 async function handleClaim(interaction: Interaction): Promise<void> {
-  if (!hasStaffRole(interaction)) {
-    await ephemeral(interaction, "❌ Only staff can use this command.");
-    return;
-  }
-  const result = applyClaim(interaction.channel_id || "", interactionUserId(interaction));
-  if (result === "missing") {
+  const ticket = state.tickets.get(interaction.channel_id || "");
+  if (!ticket) {
     await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
     return;
   }
-  if (result === "already") {
+  if (!isAdministrator(interaction) && !hasTicketStaffAccess(interaction, ticket)) {
+    await ephemeral(interaction, "❌ You do not have permission to claim this ticket.");
+    return;
+  }
+  if (interaction.message?.id) ticket.controlMessageId = interaction.message.id;
+  if (ticket.claimedBy || state.claiming.has(ticket.channelId)) {
     await ephemeral(interaction, "⚠️ This ticket is already claimed by another team member.");
     return;
   }
-  await ephemeral(interaction, "🔒 Ticket claimed. The Honey Lua team is on it.");
+  await defer(interaction);
+  let result: "claimed" | "already" | "missing";
+  try {
+    result = await claimTicket(ticket, interactionUserId(interaction));
+  } catch {
+    await followup(interaction, "❌ The ticket could not be claimed because its Discord permissions could not be updated.");
+    return;
+  }
+  if (result === "missing") {
+    await followup(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+    return;
+  }
+  if (result === "already") {
+    await followup(interaction, "⚠️ This ticket is already claimed by another team member.");
+    return;
+  }
+  await followup(interaction, `🔒 Ticket claimed. <@${interactionUserId(interaction)}> is now responsible for this ticket.`);
   await sendMessage(interaction.channel_id!, {
-    embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${interactionUserId(interaction)}> is now handling this ticket.`)]
+    embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${interactionUserId(interaction)}> is now handling this ticket. Other non-administrator staff members can no longer access it.`)]
   }).catch((error) => log("claim notice failed", error));
+}
+
+async function releaseTicket(ticket: Ticket): Promise<"released" | "already" | "missing"> {
+  if (!state.tickets.has(ticket.channelId)) return "missing";
+  if (!ticket.claimedBy || state.claiming.has(ticket.channelId)) return "already";
+  state.claiming.add(ticket.channelId);
+  const previousClaim = ticket.claimedBy;
+  const previousClaimedAt = ticket.claimedAt;
+  ticket.claimedBy = undefined;
+  ticket.claimedAt = undefined;
+  ticket.lastActivity = Date.now();
+  ticket.reminderSent = false;
+  try {
+    await synchronizeTicketPermissions(ticket);
+  } catch (error) {
+    ticket.claimedBy = previousClaim;
+    ticket.claimedAt = previousClaimedAt;
+    log(`release permissions failed in ${ticket.channelId}`, error);
+    throw error;
+  } finally {
+    state.claiming.delete(ticket.channelId);
+  }
+  await updateTicketControlMessage(ticket).catch((error) => log(`release UI update failed in ${ticket.channelId}`, error));
+  return "released";
+}
+
+async function handleUnclaim(interaction: Interaction): Promise<void> {
+  const ticket = state.tickets.get(interaction.channel_id || "");
+  if (!ticket) {
+    await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+    return;
+  }
+  const userId = interactionUserId(interaction);
+  if (!ticket.claimedBy) {
+    await ephemeral(interaction, "⚠️ This ticket is not currently claimed.");
+    return;
+  }
+  if (!isAdministrator(interaction) && ticket.claimedBy !== userId) {
+    await ephemeral(interaction, "❌ Only the responsible staff member or an administrator can release this ticket.");
+    return;
+  }
+  if (interaction.message?.id) ticket.controlMessageId = interaction.message.id;
+  await defer(interaction);
+  let result: "released" | "already" | "missing";
+  try {
+    result = await releaseTicket(ticket);
+  } catch {
+    await followup(interaction, "❌ The ticket could not be released because its Discord permissions could not be updated.");
+    return;
+  }
+  if (result === "missing") {
+    await followup(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+    return;
+  }
+  if (result === "already") {
+    await followup(interaction, "⚠️ This ticket is not currently claimed.");
+    return;
+  }
+  await followup(interaction, "↩️ Ticket released. The appropriate staff roles can access it again.");
+  await sendMessage(ticket.channelId, {
+    embeds: [embed(`↩️ ${BRAND} • Ticket Released`, 0x57f28a, "The ticket is available for an authorized staff member to claim.")]
+  }).catch((error) => log(`release notice failed in ${ticket.channelId}`, error));
 }
 
 function formatDuration(ms: number): string {
@@ -618,7 +902,7 @@ async function sendRating(ticket: Ticket, html: string): Promise<void> {
       ]
     }],
     components: [row([1, 2, 3, 4, 5].map((stars) => button(`rate_${stars}`, "⭐".repeat(stars), 2)))]
-  }, { name: `honey-lua-transcript-${ticket.id}.html`, content: html });
+  }, { name: `osvaldo-systems-transcript-${ticket.id}.html`, content: html });
   state.ratings.set(ticket.ownerId, {
     ticketId: ticket.id,
     channelId: ticket.channelId,
@@ -628,46 +912,53 @@ async function sendRating(ticket: Ticket, html: string): Promise<void> {
 }
 
 async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake): Promise<void> {
+  if (state.closing.has(ticket.channelId)) return;
+  state.closing.add(ticket.channelId);
   if (state.tickets.get(ticket.channelId) !== undefined) state.tickets.delete(ticket.channelId);
-  const messages = await fetchMessages(ticket.channelId).catch((error) => {
-    log(`message pagination failed in ${ticket.channelId}`, error);
-    return [];
-  });
-  const html = buildTranscript(ticket, messages, reason, closedBy);
-  await sendMessage(cfg().transcriptChannelId, {
-    embeds: [{
-      ...embed(`📄 ${BRAND} • Ticket Transcript`, 0x5865f2),
-      fields: [
-        { name: "Ticket", value: ticket.id, inline: true },
-        { name: "Type", value: ticket.typeId, inline: true },
-        { name: "Owner", value: `${ticket.ownerName} (${ticket.ownerId})`, inline: true },
-        { name: "Claimed by", value: ticket.claimedBy || "—", inline: true },
-        { name: "Closed by", value: closedBy || "system", inline: true },
-        { name: "Reason", value: reason, inline: true },
-        { name: "Messages", value: String(messages.length), inline: true },
-        { name: "Duration", value: formatDuration(Date.now() - ticket.createdAt), inline: true }
-      ]
-    }]
-  }, { name: `transcript-${ticket.id}.html`, content: html }).catch((error) => log(`transcript send failed for ${ticket.id}`, error));
-  await sendRating(ticket, html).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
-  await sendMessage(cfg().logChannelId, {
-    embeds: [{
-      ...embed(reason === "manual" ? `🔴 ${BRAND} • Closed Manually` : `🔴 ${BRAND} • Closed Automatically`, 0xed4245),
-      fields: [
-        { name: "Ticket", value: ticket.id, inline: true },
-        { name: "Type", value: ticket.typeId, inline: true },
-        { name: "Owner", value: `${ticket.ownerName} (<@${ticket.ownerId}>)`, inline: true },
-        { name: "Closed by", value: closedBy ? `<@${closedBy}>` : "system (timeout)", inline: true },
-        { name: "Messages", value: String(messages.length), inline: true },
-        { name: "Closed at", value: new Date().toISOString(), inline: true }
-      ]
-    }]
-  }).catch((error) => log(`close log failed for ${ticket.id}`, error));
-  await sendMessage(ticket.channelId, {
-    embeds: [embed(`🗑️ ${BRAND} • Closing`, 0x95a5a6, "This channel will be deleted in 10 seconds. The transcript has already been saved.")]
-  }).catch((error) => log(`countdown failed in ${ticket.channelId}`, error));
-  await Bun.sleep(10000);
-  await discordRequest(`/channels/${ticket.channelId}`, { method: "DELETE" }, undefined).catch((error) => log(`delete channel failed for ${ticket.channelId}`, error));
+  try {
+    const messages = await fetchMessages(ticket.channelId).catch((error) => {
+      log(`message pagination failed in ${ticket.channelId}`, error);
+      return [];
+    });
+    const html = buildTranscript(ticket, messages, reason, closedBy);
+    await sendMessage(cfg().transcriptChannelId, {
+      embeds: [{
+        ...embed(`📄 ${BRAND} • Ticket Transcript`, 0x5865f2),
+        fields: [
+          { name: "Ticket", value: ticket.id, inline: true },
+          { name: "Type", value: ticket.typeId, inline: true },
+          { name: "Owner", value: `${ticket.ownerName} (${ticket.ownerId})`, inline: true },
+          { name: "Claimed by", value: ticket.claimedBy || "—", inline: true },
+          { name: "Closed by", value: closedBy || "system", inline: true },
+          { name: "Reason", value: reason, inline: true },
+          { name: "Messages", value: String(messages.length), inline: true },
+          { name: "Duration", value: formatDuration(Date.now() - ticket.createdAt), inline: true }
+        ]
+      }]
+    }, { name: `transcript-${ticket.id}.html`, content: html }).catch((error) => log(`transcript send failed for ${ticket.id}`, error));
+    await sendRating(ticket, html).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
+    await sendMessage(cfg().logChannelId, {
+      embeds: [{
+        ...embed(reason === "manual" ? `🔴 ${BRAND} • Closed Manually` : `🔴 ${BRAND} • Closed Automatically`, 0xed4245),
+        fields: [
+          { name: "Ticket", value: ticket.id, inline: true },
+          { name: "Type", value: ticket.typeId, inline: true },
+          { name: "Owner", value: `${ticket.ownerName} (<@${ticket.ownerId}>)`, inline: true },
+          { name: "Closed by", value: closedBy ? `<@${closedBy}>` : "system (timeout)", inline: true },
+          { name: "Messages", value: String(messages.length), inline: true },
+          { name: "Closed at", value: new Date().toISOString(), inline: true }
+        ]
+      }]
+    }).catch((error) => log(`close log failed for ${ticket.id}`, error));
+    await sendMessage(ticket.channelId, {
+      embeds: [embed(`🗑️ ${BRAND} • Closing`, 0x95a5a6, "This channel will be deleted in 10 seconds. The transcript has already been saved.")]
+    }).catch((error) => log(`countdown failed in ${ticket.channelId}`, error));
+    await Bun.sleep(10000);
+    await discordRequest(`/channels/${ticket.channelId}`, { method: "DELETE" }, undefined)
+      .catch((error) => log(`delete channel failed for ${ticket.channelId}`, error));
+  } finally {
+    state.closing.delete(ticket.channelId);
+  }
 }
 
 async function handleClose(interaction: Interaction): Promise<void> {
@@ -676,9 +967,8 @@ async function handleClose(interaction: Interaction): Promise<void> {
     await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
     return;
   }
-  const staff = hasStaffRole(interaction);
-  if (!staff && interactionUserId(interaction) !== ticket.ownerId) {
-    await ephemeral(interaction, "❌ Only the ticket owner or a Honey Lua team member can close this ticket.");
+  if (!canInteractWithTicket(interaction, ticket)) {
+    await ephemeral(interaction, "❌ You no longer have permission to interact with this ticket.");
     return;
   }
   await defer(interaction);
@@ -791,6 +1081,7 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
       const type = findType(customId.replace("ticket_open_", ""));
       if (type) await interactionCallback(interaction, 9, modal(type));
     } else if (interaction.type === 3 && customId === "ticket_claim") await handleClaim(interaction);
+    else if (interaction.type === 3 && customId === "ticket_unclaim") await handleUnclaim(interaction);
     else if (interaction.type === 3 && customId === "ticket_close") await handleClose(interaction);
     else if (interaction.type === 3 && customId.startsWith("rate_")) {
       const stars = Number(customId.replace("rate_", ""));
@@ -810,14 +1101,13 @@ async function maintenance(): Promise<void> {
       continue;
     }
     if (ticket.claimedBy && idle >= 6 * 60 * 60 * 1000) {
-      ticket.claimedBy = undefined;
-      ticket.claimedAt = undefined;
-      ticket.lastActivity = now;
-      ticket.reminderSent = false;
-      void sendMessage(ticket.channelId, {
-        content: cfg().mentionStaffOnUnclaim ? staffMention() : undefined,
-        embeds: [embed(`⚠️ ${BRAND} • Claim Removed`, 0xed4245, "The claim was removed after 6 hours of inactivity.")]
-      }).catch((error) => log(`unclaim notice failed in ${ticket.channelId}`, error));
+      void releaseTicket(ticket).then(() => {
+        const type = findType(ticket.typeId);
+        return sendMessage(ticket.channelId, {
+          content: cfg().mentionStaffOnUnclaim && type ? ticketMention(type) : undefined,
+          embeds: [embed(`⚠️ ${BRAND} • Claim Removed`, 0xed4245, "The claim was removed after 6 hours of inactivity.")]
+        });
+      }).catch((error) => log(`unclaim failed in ${ticket.channelId}`, error));
       continue;
     }
     if (idle >= 10 * 60 * 60 * 1000 && !ticket.reminderSent) {
@@ -833,6 +1123,87 @@ async function maintenance(): Promise<void> {
   const cooldownTtl = Math.max(cfg().actionCooldownMs, 60000);
   for (const [key, created] of state.actionCooldowns) if (now - created >= cooldownTtl) state.actionCooldowns.delete(key);
   for (const [id, created] of state.createCooldowns) if (now - created >= Math.max(cfg().cooldownCreateMs, 60000)) state.createCooldowns.delete(id);
+}
+
+function snowflakeCreatedAt(id: Snowflake): number {
+  try {
+    return Number((BigInt(id) >> 22n) + 1420070400000n);
+  } catch {
+    return Date.now();
+  }
+}
+
+function parseTicketTopic(topic: string | undefined): { typeId?: string; ownerId?: Snowflake; createdAt?: number } {
+  if (!topic?.startsWith("osvaldo-systems:v1;")) return {};
+  const values = new Map(
+    topic.slice("osvaldo-systems:v1;".length)
+      .split(";")
+      .map((part) => part.split("="))
+      .filter(([key, value]) => key && value)
+  );
+  return {
+    typeId: values.get("type"),
+    ownerId: values.get("owner"),
+    createdAt: Number(values.get("created")) || undefined
+  };
+}
+
+function firstMemberOverwrite(
+  overwrites: Json[] | undefined,
+  predicate: (overwrite: Json) => boolean
+): Snowflake | undefined {
+  return (overwrites || []).find((overwrite) => overwrite.type === 1 && predicate(overwrite))?.id;
+}
+
+async function hydrateOpenTickets(): Promise<void> {
+  try {
+    const channels = await discordRequest(`/guilds/${cfg().guildId}/channels`);
+    if (!Array.isArray(channels)) return;
+    for (const channel of channels) {
+      const type = ticketTypeFromChannelName(channel.name || "");
+      if (!type || channel.parent_id !== cfg().ticketCategoryId || state.tickets.has(channel.id)) continue;
+
+      const topic = parseTicketTopic(channel.topic);
+      const ownerId = topic.ownerId || firstMemberOverwrite(
+        channel.permission_overwrites,
+        (overwrite) => overwrite.id !== state.botId &&
+          (Number(overwrite.allow || 0) & PERMISSIONS.VIEW_CHANNEL) !== 0
+      );
+      if (!ownerId) {
+        log(`skipping ticket channel ${channel.id}; owner could not be recovered`);
+        continue;
+      }
+      const claimedBy = firstMemberOverwrite(
+        channel.permission_overwrites,
+        (overwrite) =>
+          overwrite.id !== state.botId &&
+          overwrite.id !== ownerId &&
+          (Number(overwrite.allow || 0) & PERMISSIONS.SEND_MESSAGES) !== 0
+      );
+      const lastActivity = channel.last_message_id
+        ? snowflakeCreatedAt(channel.last_message_id)
+        : topic.createdAt || snowflakeCreatedAt(channel.id);
+      const ticket: Ticket = {
+        id: channel.id,
+        typeId: topic.typeId && findType(topic.typeId) ? topic.typeId : type.typeId,
+        channelId: channel.id,
+        ownerId,
+        ownerName: "user",
+        answers: [],
+        createdAt: topic.createdAt || snowflakeCreatedAt(channel.id),
+        claimedBy,
+        claimedAt: claimedBy ? lastActivity : undefined,
+        lastActivity,
+        reminderSent: false
+      };
+      state.tickets.set(channel.id, ticket);
+      await synchronizeTicketPermissions(ticket, channel.permission_overwrites)
+        .catch((error) => log(`permission reconciliation failed in ${channel.id}`, error));
+    }
+    log(`hydrated ${state.tickets.size} open ticket(s) from Discord channels`);
+  } catch (error) {
+    log("open ticket hydration failed", error);
+  }
 }
 
 async function registerCommand(): Promise<void> {
@@ -872,6 +1243,12 @@ async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
     state.botId = payload.d.user.id;
     state.applicationId = payload.d.application?.id || payload.d.user.id;
     log(`connected as ${payload.d.user.username}`);
+    if (!state.ticketsHydrated && !state.hydratingTickets) {
+      state.hydratingTickets = true;
+      await Promise.allSettled([loadGuildRoles(), hydrateOpenTickets()]);
+      state.hydratingTickets = false;
+      state.ticketsHydrated = true;
+    }
     await registerCommand().catch((error) => log("command registration failed", error));
   } else if (payload.t === "MESSAGE_CREATE") {
     const message = payload.d;
@@ -880,11 +1257,16 @@ async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
       if (ticket) {
         ticket.lastActivity = Date.now();
         ticket.reminderSent = false;
-        if (message.member?.roles?.includes(cfg().staffRoleId) && !ticket.claimedBy) {
-          applyClaim(message.channel_id, message.author.id);
-          void sendMessage(message.channel_id, {
+        const type = findType(ticket.typeId);
+        if (
+          message.author.id !== ticket.ownerId &&
+          type &&
+          hasAnyRole(message.member?.roles, ticketAccessRoleIds(type)) &&
+          !ticket.claimedBy
+        ) {
+          void claimTicket(ticket, message.author.id).then(() => sendMessage(message.channel_id, {
             embeds: [embed(`🔒 ${BRAND} • Ticket Claimed`, 0xf0b429, `<@${message.author.id}> started handling this ticket automatically.`)]
-          }).catch((error) => log("auto-claim notice failed", error));
+          })).catch((error) => log("auto-claim failed", error));
         }
       }
     }
@@ -903,6 +1285,7 @@ function scheduleReconnect(delay = 3000): void {
 }
 
 function connectGateway(): void {
+  if (state.gateway && (state.gateway.readyState === 0 || state.gateway.readyState === 1)) return;
   const url = state.sessionId && state.resumeUrl
     ? `${state.resumeUrl}?v=10&encoding=json`
     : GATEWAY;
@@ -930,7 +1313,7 @@ async function handleGateway(payload: GatewayPayload): Promise<void> {
       gatewaySend(2, {
         token: cfg().token,
         intents: 1 | 512 | 4096 | 32768,
-        properties: { os: "linux", browser: "bun-ticket-bot", device: "bun-ticket-bot" }
+        properties: { os: "linux", browser: "osvaldo-systems", device: "osvaldo-systems" }
       });
     }
     return;
