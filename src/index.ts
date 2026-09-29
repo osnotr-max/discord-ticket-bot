@@ -202,7 +202,10 @@ const state = {
   closing: new Set<Snowflake>(),
   creating: new Set<string>(),
   guildRoleIds: new Set<Snowflake>(),
+  guildRoleNames: new Map<Snowflake, string>(),
   guildRolePermissions: new Map<Snowflake, bigint>(),
+  memberRoles: new Map<Snowflake, Snowflake[]>(),
+  memberNames: new Map<Snowflake, string>(),
   guildRolesLoaded: false,
   ticketsHydrated: false,
   hydratingTickets: false
@@ -576,6 +579,7 @@ async function loadGuildRoles(): Promise<void> {
     const roles = await discordRequest(`/guilds/${cfg().guildId}/roles`);
     if (!Array.isArray(roles)) throw new Error("Discord returned an invalid role list.");
     state.guildRoleIds = new Set(roles.map((role) => role.id).filter(Boolean));
+    state.guildRoleNames = new Map(roles.filter((role) => role?.id && role?.name).map((role) => [role.id, String(role.name)] as [Snowflake, string]));
     state.guildRolePermissions = new Map(
       roles
         .filter((role) => role?.id)
@@ -585,6 +589,45 @@ async function loadGuildRoles(): Promise<void> {
   } catch (error) {
     state.guildRolesLoaded = false;
     log("guild role discovery failed; ticket creation is paused to prevent insecure permissions", error);
+  }
+}
+
+function memberDisplayLabel(userId: Snowflake): string {
+  return state.memberNames.get(userId) || userId;
+}
+
+function renderRoleBadges(roleIds: unknown): string {
+  if (!Array.isArray(roleIds)) return "";
+  const badges = roleIds
+    .filter((roleId) => roleId && roleId !== cfg().guildId)
+    .map((roleId) => {
+      const name = state.guildRoleNames.get(String(roleId));
+      if (!name) return "";
+      return "<span class=\"role-badge\" title=\"" + escapeHtml(name) + "\">@" + escapeHtml(name) + "</span>";
+    })
+    .filter(Boolean)
+    .slice(0, 6)
+    .join("");
+  return badges ? "<div class=\"roles\">" + badges + "</div>" : "";
+}
+
+async function hydrateTranscriptMembers(messages: Json[], extraIds: Snowflake[] = []): Promise<void> {
+  const ids = [...new Set([...messages.map((message) => String(message.author?.id || "")), ...extraIds])]
+    .filter(Boolean)
+    .filter((id) => !state.memberRoles.has(id));
+  for (let offset = 0; offset < ids.length; offset += 5) {
+    await Promise.all(ids.slice(offset, offset + 5).map(async (userId) => {
+      try {
+        const member = await discordRequest(`/guilds/${cfg().guildId}/members/${userId}`);
+        const user = member?.user || {};
+        const label = displayName(member, user);
+        if (label) state.memberNames.set(userId, label);
+        state.memberRoles.set(userId, Array.isArray(member?.roles) ? member.roles : []);
+      } catch (error) {
+        state.memberRoles.set(userId, []);
+        log(`transcript member lookup failed for ${userId}`, error);
+      }
+    }));
   }
 }
 
@@ -858,7 +901,7 @@ function formatDuration(ms: number): string {
   return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
 }
 
-async function fetchMessages(channelId: Snowflake): Promise<string[]> {
+async function fetchMessages(channelId: Snowflake, extraMemberIds: Snowflake[] = []): Promise<string[]> {
   const messages: string[] = [];
   let before = "";
   for (let page = 0; page < cfg().maxTranscriptPages; page++) {
@@ -868,6 +911,7 @@ async function fetchMessages(channelId: Snowflake): Promise<string[]> {
     // Render and release each REST page immediately. Keeping 5,000 raw
     // Discord message objects alive while also building HTML can cause a
     // large transient memory spike on a small server.
+    await hydrateTranscriptMembers(current, extraMemberIds);
     messages.push(...current.map(renderMessage));
     if (current.length < 100) break;
     before = current[current.length - 1].id;
@@ -880,7 +924,7 @@ async function fetchMessages(channelId: Snowflake): Promise<string[]> {
 const TRANSCRIPT_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" });
 
 const TRANSCRIPT_CSS = `<style>
-:root{color-scheme:dark;--bg:#111214;--surface:#1b1d21;--surface-2:#23262b;--surface-3:#2b2f36;--line:#383c45;--text:#f2f3f5;--muted:#a6adba;--accent:#f0b429;--accent-2:#ffcf63;--success:#57f287;--shadow:0 18px 50px rgba(0,0,0,.28)}*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;padding:32px 20px 48px;background:radial-gradient(circle at 50% -10%,#2d2413 0,#17181b 34%,var(--bg) 70%);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}.shell{width:min(1080px,100%);margin:0 auto}a{color:var(--accent-2);text-decoration:none}a:hover{text-decoration:underline}.hero{position:relative;overflow:hidden;padding:30px;border:1px solid #5c471b;border-radius:20px;background:linear-gradient(135deg,rgba(240,180,41,.18),rgba(35,38,43,.96) 48%);box-shadow:var(--shadow);margin-bottom:20px}.hero:after{content:"";position:absolute;width:240px;height:240px;right:-100px;top:-120px;border:1px solid rgba(240,180,41,.25);border-radius:50%;box-shadow:0 0 0 24px rgba(240,180,41,.04),0 0 0 48px rgba(240,180,41,.03)}.eyebrow{color:var(--accent-2);font-size:11px;font-weight:800;letter-spacing:.13em;text-transform:uppercase}.hero-row{position:relative;z-index:1;display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.hero h1{margin:7px 0 8px;font-size:clamp(26px,4vw,42px);line-height:1.1;letter-spacing:-.03em}.hero p{max-width:700px;margin:0;color:#d5d8de;font-size:15px}.status{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;padding:8px 12px;border:1px solid rgba(87,242,135,.35);border-radius:999px;background:rgba(87,242,135,.1);color:var(--success);font-size:12px;font-weight:800}.status-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}.stats{position:relative;z-index:1;display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:26px}.stat{display:flex;align-items:center;gap:10px;padding:13px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(17,18,20,.42)}.stat-icon{font-size:18px}.stat-label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.stat-value{display:block;margin-top:2px;font-weight:750;color:var(--text)}.card{padding:22px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,var(--surface-2),var(--surface));box-shadow:0 8px 28px rgba(0,0,0,.12);margin-bottom:18px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.card-heading h2{margin:3px 0 0;color:var(--text);font-size:20px;letter-spacing:-.02em}.card-heading p{margin:4px 0 0;color:var(--muted)}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.detail{padding:12px 14px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:rgba(0,0,0,.12)}.detail-label{display:block;color:var(--muted);font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.detail-value{display:block;margin-top:3px;word-break:break-word}.answers{display:grid;gap:10px}.answer{padding:14px 16px;border-left:3px solid var(--accent);border-radius:0 10px 10px 0;background:rgba(240,180,41,.07)}.answer-label{color:var(--accent-2);font-size:12px;font-weight:800}.answer-value{margin-top:4px;white-space:pre-wrap;word-break:break-word}.timeline{position:relative;padding-left:18px}.timeline:before{content:"";position:absolute;left:3px;top:5px;bottom:5px;width:2px;background:linear-gradient(var(--accent),rgba(240,180,41,0))}.msg{position:relative;padding:0 0 22px 22px}.msg:before{content:"";position:absolute;left:-1px;top:5px;width:9px;height:9px;border:3px solid var(--surface);border-radius:50%;background:var(--accent)}.msg.bot:before{background:#7289da}.message-head{display:flex;align-items:center;gap:10px;min-height:32px}.avatar{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface-3);object-fit:cover}.identity{display:flex;align-items:center;gap:7px;min-width:0}.author{font-weight:800;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.uid{color:var(--muted);font-size:11px}.badge{padding:2px 5px;border-radius:4px;background:#5865f2;color:#fff;font-size:9px;font-weight:900;letter-spacing:.06em}.ts{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:12px}.body{margin:8px 0 0 42px;white-space:normal;word-break:break-word;color:#d9dce1}.muted,.empty{color:var(--muted);font-style:italic}.attachments,.embed-list{display:grid;gap:8px;margin:10px 0 0 42px}.attachment{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:rgba(0,0,0,.16);word-break:break-word}.attachment-icon{font-size:17px}.attachment-image{display:block;max-width:min(520px,100%);max-height:360px;margin:10px 0 0 42px;border:1px solid var(--line);border-radius:10px;object-fit:contain;background:#0b0c0e}.embed-card{padding:11px 13px;border-left:3px solid #5865f2;border-radius:0 8px 8px 0;background:rgba(88,101,242,.08)}.embed-title{font-weight:800}.embed-description{margin-top:3px;color:#d9dce1;white-space:pre-wrap}.footer{padding:22px 0 0;color:var(--muted);text-align:center;font-size:12px}.footer strong{color:var(--accent-2)}@media(max-width:720px){body{padding:18px 12px 32px}.hero{padding:22px 18px;border-radius:16px}.hero-row{display:block}.status{margin-top:18px}.stats{grid-template-columns:repeat(2,1fr)}.card{padding:17px}.detail-grid{grid-template-columns:1fr}.card-heading{display:block}.ts{width:100%;margin:3px 0 0 42px}.message-head{align-items:flex-start;flex-wrap:wrap}.body,.attachments,.embed-list,.attachment-image{margin-left:42px}}
+:root{color-scheme:dark;--bg:#0e0b09;--surface:#171310;--surface-2:#211b16;--surface-3:#2d241c;--line:#44372d;--text:#fff8ed;--muted:#b9aa9d;--accent:#f0b429;--accent-2:#ffd875;--success:#57f287;--shadow:0 18px 50px rgba(0,0,0,.32)}*{box-sizing:border-box}html{background:var(--bg)}body{margin:0;padding:32px 20px 48px;background:radial-gradient(circle at 50% -10%,#2d2413 0,#17181b 34%,var(--bg) 70%);color:var(--text);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}.shell{width:min(900px,100%);margin:0 auto}a{color:var(--accent-2);text-decoration:none}a:hover{text-decoration:underline}.hero{position:relative;overflow:hidden;padding:30px;border:1px solid #5c471b;border-radius:20px;background:linear-gradient(135deg,rgba(240,180,41,.18),rgba(35,38,43,.96) 48%);box-shadow:var(--shadow);margin-bottom:20px}.hero:after{content:"";position:absolute;width:240px;height:240px;right:-100px;top:-120px;border:1px solid rgba(240,180,41,.25);border-radius:50%;box-shadow:0 0 0 24px rgba(240,180,41,.04),0 0 0 48px rgba(240,180,41,.03)}.eyebrow{color:var(--accent-2);font-size:11px;font-weight:800;letter-spacing:.13em;text-transform:uppercase}.hero-row{position:relative;z-index:1;display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.hero h1{margin:7px 0 8px;font-size:clamp(26px,4vw,42px);line-height:1.1;letter-spacing:-.03em}.hero p{max-width:700px;margin:0;color:#d5d8de;font-size:15px}.status{display:inline-flex;align-items:center;gap:7px;flex:0 0 auto;padding:8px 12px;border:1px solid rgba(87,242,135,.35);border-radius:999px;background:rgba(87,242,135,.1);color:var(--success);font-size:12px;font-weight:800}.status-dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}.stats{position:relative;z-index:1;display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:26px}.stat{display:flex;align-items:center;gap:10px;padding:13px;border:1px solid rgba(255,255,255,.08);border-radius:12px;background:rgba(17,18,20,.42)}.stat-icon{font-size:18px}.stat-label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.stat-value{display:block;margin-top:2px;font-weight:750;color:var(--text)}.card{padding:22px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,var(--surface-2),var(--surface));box-shadow:0 8px 28px rgba(0,0,0,.12);margin-bottom:18px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:18px}.card-heading h2{margin:3px 0 0;color:var(--text);font-size:20px;letter-spacing:-.02em}.card-heading p{margin:4px 0 0;color:var(--muted)}.detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.detail{padding:12px 14px;border:1px solid rgba(255,255,255,.06);border-radius:10px;background:rgba(0,0,0,.12)}.detail-label{display:block;color:var(--muted);font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.detail-value{display:block;margin-top:3px;word-break:break-word}.answers{display:grid;gap:10px}.answer{padding:14px 16px;border-left:3px solid var(--accent);border-radius:0 10px 10px 0;background:rgba(240,180,41,.07)}.answer-label{color:var(--accent-2);font-size:12px;font-weight:800}.answer-value{margin-top:4px;white-space:pre-wrap;word-break:break-word}.timeline{position:relative;padding-left:18px}.timeline:before{content:"";position:absolute;left:3px;top:5px;bottom:5px;width:2px;background:linear-gradient(var(--accent),rgba(240,180,41,0))}.msg{position:relative;padding:14px 16px 16px 22px;border:1px solid rgba(255,255,255,.08);border-radius:14px;background:linear-gradient(135deg,rgba(255,255,255,.045),rgba(0,0,0,.12));margin:0 0 10px}.msg:before{content:"";position:absolute;left:-1px;top:5px;width:9px;height:9px;border:3px solid var(--surface);border-radius:50%;background:var(--accent)}.msg.bot:before{background:#7289da}.message-head{display:flex;align-items:center;gap:10px;min-height:32px}.avatar{width:32px;height:32px;border:1px solid var(--line);border-radius:50%;background:var(--surface-3);object-fit:cover}.identity-wrap{min-width:0}.identity{display:flex;align-items:center;gap:7px;min-width:0}.author{font-weight:800;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.uid{color:var(--muted);font-size:11px}.roles{display:flex;flex-wrap:wrap;gap:4px;margin-top:3px}.role-badge,.mention{display:inline-block;padding:1px 6px;border:1px solid rgba(240,180,41,.34);border-radius:5px;background:rgba(240,180,41,.12);color:var(--accent-2);font-size:11px;font-weight:700}.role-mention{padding:0 5px}.badge{padding:2px 5px;border-radius:4px;background:#5865f2;color:#fff;font-size:9px;font-weight:900;letter-spacing:.06em}.ts{margin-left:auto;flex:0 0 auto;color:var(--muted);font-size:12px}.body{margin:8px 0 0 42px;white-space:normal;word-break:break-word;color:#d9dce1}.muted,.empty{color:var(--muted);font-style:italic}.attachments,.embed-list{display:grid;gap:8px;margin:10px 0 0 42px}.attachment{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:9px;background:rgba(0,0,0,.16);word-break:break-word}.attachment-icon{font-size:17px}.attachment-image{display:block;max-width:min(520px,100%);max-height:360px;margin:10px 0 0 42px;border:1px solid var(--line);border-radius:10px;object-fit:contain;background:#0b0c0e}.embed-card{padding:14px 16px;border:1px solid rgba(88,101,242,.35);border-left:4px solid #7289da;border-radius:10px;background:linear-gradient(135deg,rgba(88,101,242,.15),rgba(88,101,242,.045))}.embed-author{color:#aeb8ff;font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.embed-title{display:block;margin-top:2px;font-weight:850;font-size:15px}.embed-link:hover{color:#fff;text-decoration:underline}.embed-description{margin-top:5px;color:#e0e2ea;white-space:pre-wrap}.embed-field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;margin-top:10px}.embed-field{display:grid;gap:2px;padding:8px 9px;border-radius:7px;background:rgba(0,0,0,.16)}.embed-field strong{font-size:11px;color:#c7cbff}.embed-field span{white-space:pre-wrap;word-break:break-word}.embed-image{display:block;width:100%;max-height:360px;margin-top:12px;border-radius:8px;object-fit:contain;background:#0b0c0e}.footer{padding:22px 0 0;color:var(--muted);text-align:center;font-size:12px}.footer strong{color:var(--accent-2)}@media(max-width:720px){body{padding:18px 12px 32px}.hero{padding:22px 18px;border-radius:16px}.hero-row{display:block}.status{margin-top:18px}.stats{grid-template-columns:repeat(2,1fr)}.card{padding:17px}.detail-grid{grid-template-columns:1fr}.card-heading{display:block}.embed-field-grid{grid-template-columns:1fr}.ts{width:100%;margin:3px 0 0 42px}.message-head{align-items:flex-start;flex-wrap:wrap}.body,.attachments,.embed-list,.attachment-image{margin-left:42px}}
 </style>`;
 
 function formatTranscriptDate(value: string | number | undefined): string {
@@ -912,45 +956,77 @@ function transcriptDetail(label: string, value: string): string {
 function renderTranscriptEmbed(embedData: Json): string {
   const title = String(embedData.title || "").trim();
   const description = String(embedData.description || "").trim();
-  if (!title && !description) return "";
-  return `<div class="embed-card">${title ? `<div class="embed-title">${escapeHtml(title)}</div>` : ""}${description ? `<div class="embed-description">${escapeHtml(description)}</div>` : ""}</div>`;
+  const author = String(embedData.author?.name || "").trim();
+  const embedUrl = transcriptUrl(embedData.url);
+  const imageUrl = transcriptUrl(embedData.image?.url || embedData.thumbnail?.url);
+  const fields = Array.isArray(embedData.fields) ? embedData.fields : [];
+  if (!title && !description && !author && !fields.length && imageUrl === "#") return "";
+  let html = "<div class=\"embed-card\">";
+  if (author) html += "<div class=\"embed-author\">" + escapeHtml(author) + "</div>";
+  if (title) html += embedUrl !== "#" ? "<a class=\"embed-title embed-link\" href=\"" + escapeHtml(embedUrl) + "\" target=\"_blank\" rel=\"noreferrer\">" + escapeHtml(title) + "</a>" : "<div class=\"embed-title\">" + escapeHtml(title) + "</div>";
+  if (description) html += "<div class=\"embed-description\">" + escapeHtml(description) + "</div>";
+  if (fields.length) {
+    html += "<div class=\"embed-field-grid\">";
+    for (const field of fields) {
+      html += "<div class=\"embed-field\"><strong>" + escapeHtml(String(field.name || "Field")) + "</strong><span>" + escapeHtml(String(field.value || "")) + "</span></div>";
+    }
+    html += "</div>";
+  }
+  if (imageUrl !== "#") html += "<a href=\"" + escapeHtml(imageUrl) + "\" target=\"_blank\" rel=\"noreferrer\"><img class=\"embed-image\" src=\"" + escapeHtml(imageUrl) + "\" alt=\"" + escapeHtml(title || "Embed image") + "\" loading=\"lazy\"></a>";
+  return html + "</div>";
+}
+
+function renderTranscriptBody(content: string): string {
+  let body = escapeHtml(content).replaceAll(String.fromCharCode(10), "<br>");
+  body = body.replace(/&lt;@&amp;(\d+)&gt;/g, (_match, roleId) => {
+    const roleName = state.guildRoleNames.get(roleId);
+    return roleName ? "<span class=\"mention role-mention\">@" + escapeHtml(roleName) + "</span>" : "<span class=\"mention role-mention\">@Role</span>";
+  });
+  body = body.replace(/&lt;@!?(\d+)&gt;/g, (_match, userId) => {
+    const userName = state.memberNames.get(userId);
+    return "<span class=\"mention\">@" + escapeHtml(userName || "user") + "</span>";
+  });
+  return body;
 }
 
 function renderMessage(message: Json): string {
   const author = message.author || {};
+  const memberRoles = state.memberRoles.get(String(author.id || "")) || message.member?.roles || [];
+  const rolesHtml = renderRoleBadges(memberRoles);
   const avatar = author.avatar
     ? `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.png?size=64`
     : "https://cdn.discordapp.com/embed/avatars/0.png";
   const name = author.global_name || author.username || "user";
   const timestamp = String(message.timestamp || "");
   const body = message.content?.trim()
-    ? escapeHtml(message.content).replaceAll(String.fromCharCode(10), "<br>")
+    ? renderTranscriptBody(String(message.content))
     : "<span class=\"muted\">No text content</span>";
   const attachments = Array.isArray(message.attachments) ? message.attachments : [];
   const attachmentHtml = attachments.map((attachment: Json) => {
     const url = transcriptUrl(attachment.url || attachment.proxy_url);
     const filename = String(attachment.filename || "Attachment");
     const size = formatBytes(attachment.size);
-    const isImage = String(attachment.content_type || "").startsWith("image/") && url !== "#";
+    const isImage = (String(attachment.content_type || "").startsWith("image/") || /\.(png|jpe?g|gif|webp|svg)$/i.test(filename)) && url !== "#";
     if (isImage) return `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img class="attachment-image" src="${escapeHtml(url)}" alt="${escapeHtml(filename)}" loading="lazy"></a>`;
     return `<a class="attachment" href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><span class="attachment-icon">📎</span><span>${escapeHtml(filename)}${size ? ` <span class="muted">(${escapeHtml(size)})</span>` : ""}</span></a>`;
   }).join("");
   const embedHtml = (Array.isArray(message.embeds) ? message.embeds : []).map(renderTranscriptEmbed).filter(Boolean).join("");
   const botBadge = author.bot ? "<span class=\"badge\">BOT</span>" : "";
-  return `<article class="msg${author.bot ? " bot" : ""}"><div class="message-head"><img class="avatar" src="${escapeHtml(avatar)}" alt="" loading="lazy"><div class="identity"><span class="author">${escapeHtml(name)}</span>${botBadge}<span class="uid">${escapeHtml(author.id || "")}</span></div><time class="ts" datetime="${escapeHtml(timestamp)}">${escapeHtml(formatTranscriptDate(timestamp))}</time></div><div class="body">${body}</div>${attachmentHtml ? `<div class="attachments">${attachmentHtml}</div>` : ""}${embedHtml ? `<div class="embed-list">${embedHtml}</div>` : ""}</article>`;
+  return `<article class="msg${author.bot ? " bot" : ""}"><div class="message-head"><img class="avatar" src="${escapeHtml(avatar)}" alt="" loading="lazy"><div class="identity-wrap"><div class="identity"><span class="author">${escapeHtml(name)}</span>${botBadge}<span class="uid">${escapeHtml(author.id || "")}</span></div>${rolesHtml}</div><time class="ts" datetime="${escapeHtml(timestamp)}">${escapeHtml(formatTranscriptDate(timestamp))}</time></div><div class="body">${body}</div>${attachmentHtml ? `<div class="attachments">${attachmentHtml}</div>` : ""}${embedHtml ? `<div class="embed-list">${embedHtml}</div>` : ""}</article>`;
 }
 
 function buildTranscript(ticket: Ticket, messages: string[], reason: string, closedBy?: Snowflake): string {
   const type = findType(ticket.typeId);
   const closedAt = Date.now();
-  const claimed = ticket.claimedBy || "Unclaimed";
-  const closeUser = closedBy || "System";
+  const claimed = ticket.claimedBy ? memberDisplayLabel(ticket.claimedBy) : "Unclaimed";
+  const closeUser = closedBy ? memberDisplayLabel(closedBy) : "System";
+  const ownerLabel = memberDisplayLabel(ticket.ownerId);
   const typeLabel = type?.buttonLabel || ticket.typeId;
   const statusLabel = reason.startsWith("automatic") ? "Closed automatically" : "Closed manually";
   const answerCount = ticket.answers.filter(([, value]) => Boolean(value.trim())).length;
   const duration = formatDuration(closedAt - ticket.createdAt);
   let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>${escapeHtml(BRAND)} Transcript ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><main class="shell"><header class="hero"><div class="eyebrow">${escapeHtml(BRAND)} Support · Ticket transcript</div><div class="hero-row"><div><h1>Ticket ${escapeHtml(ticket.id)}</h1><p>A complete, chronological record of the request, submitted answers and support conversation.</p></div><span class="status"><span class="status-dot"></span>${escapeHtml(statusLabel)}</span></div><div class="stats">${transcriptStat("💬", "Messages", String(messages.length))}${transcriptStat("⏱️", "Duration", duration)}${transcriptStat("📝", "Answers", String(answerCount))}${transcriptStat("✓", "Status", "Closed")}</div></header>`;
-  html += `<section class="card"><div class="card-heading"><div><div class="eyebrow">Ticket details</div><h2>Context and ownership</h2><p>These details describe how the ticket was opened and resolved.</p></div></div><div class="detail-grid">${transcriptDetail("Type", typeLabel)}${transcriptDetail("Owner", `${ticket.ownerName} (${ticket.ownerId})`)}${transcriptDetail("Claimed by", claimed)}${transcriptDetail("Closed by", closeUser)}${transcriptDetail("Reason", reason)}${transcriptDetail("Created", formatTranscriptDate(ticket.createdAt))}${transcriptDetail("Closed", formatTranscriptDate(closedAt))}${transcriptDetail("Ticket ID", ticket.id)}</div></section>`;
+  html += `<section class="card"><div class="card-heading"><div><div class="eyebrow">Ticket details</div><h2>Context and ownership</h2><p>These details describe how the ticket was opened and resolved.</p></div></div><div class="detail-grid">${transcriptDetail("Type", typeLabel)}${transcriptDetail("Owner", `${ownerLabel} (${ticket.ownerId})`)}${transcriptDetail("Claimed by", claimed)}${transcriptDetail("Closed by", closeUser)}${transcriptDetail("Reason", reason)}${transcriptDetail("Created", formatTranscriptDate(ticket.createdAt))}${transcriptDetail("Closed", formatTranscriptDate(closedAt))}${transcriptDetail("Ticket ID", ticket.id)}</div></section>`;
   html += `<section class="card"><div class="card-heading"><div><div class="eyebrow">Intake</div><h2>Submitted answers</h2><p>The information provided when the ticket was created.</p></div></div>`;
   if (!ticket.answers.length) html += "<p class=\"empty\">No answers were recorded for this ticket.</p>";
   else {
@@ -1002,7 +1078,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
   state.closing.add(ticket.channelId);
   if (state.tickets.get(ticket.channelId) !== undefined) state.tickets.delete(ticket.channelId);
   try {
-    const messages = await fetchMessages(ticket.channelId).catch((error) => {
+    const messages = await fetchMessages(ticket.channelId, [ticket.ownerId, ticket.claimedBy || "", closedBy || ""]).catch((error) => {
       log(`message pagination failed in ${ticket.channelId}`, error);
       return [];
     });
