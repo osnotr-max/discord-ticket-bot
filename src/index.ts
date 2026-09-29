@@ -21,6 +21,8 @@ const STAFF_REPORT_ROLE_IDS = [
 const USER_REPORT_ROLE_ID = "1525161655053320385";
 const BRAND = "Honeylua";
 const SUPPORT_NAME = "Honeylua Support";
+const BOT_VERSION = "2.5.1";
+const BOT_STARTED_AT = Date.now();
 
 type Snowflake = string;
 type Json = Record<string, any>;
@@ -52,7 +54,6 @@ interface Config {
   requestTimeoutMs: number;
   transcriptPageDelayMs: number;
   maxTranscriptBytes: number;
-  maxTranscriptBundleBytes: number;
 }
 
 interface Ticket {
@@ -269,7 +270,6 @@ function loadConfig(): Config {
     // The transcript will gracefully keep the newest messages if this is exceeded.
     maxTranscriptBytes: Math.min(18 * 1024 * 1024, Math.max(1 * 1024 * 1024, integerEnv("MAX_TRANSCRIPT_BYTES", 18 * 1024 * 1024))),
     // Keep the complete offline bundle below Discord's broadly available free upload limit.
-    maxTranscriptBundleBytes: Math.min(19 * 1024 * 1024, Math.max(2 * 1024 * 1024, integerEnv("MAX_TRANSCRIPT_BUNDLE_BYTES", 19 * 1024 * 1024)))
   };
 }
 
@@ -1335,7 +1335,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
   try {
     const capture = await fetchMessages(ticket.channelId, [ticket.ownerId, ticket.claimedBy || "", closedBy || ""]).catch((error) => {
       log(`message pagination failed in ${ticket.channelId}`, error);
-      return { messages: [], assets: new Map<string, Uint8Array>() };
+      return { messages: [] };
     });
     const messages = capture.messages;
     const { html, omitted } = fitTranscriptToUploadBudget(ticket, messages, reason, closedBy);
@@ -1535,6 +1535,97 @@ async function handleModalSubmit(interaction: Interaction): Promise<void> {
   }
 }
 
+function interactionOption(interaction: Interaction, name: string): string {
+  const option = Array.isArray(interaction.data?.options)
+    ? interaction.data.options.find((entry: Json) => entry?.name === name)
+    : undefined;
+  return String(option?.value ?? "").trim();
+}
+
+async function handleCloseCommand(interaction: Interaction): Promise<void> {
+  const ticket = state.tickets.get(interaction.channel_id || "");
+  if (!ticket) {
+    await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+    return;
+  }
+  if (!canInteractWithTicket(interaction, ticket)) {
+    await ephemeral(interaction, "❌ You do not have permission to close this ticket.");
+    return;
+  }
+  const reason = truncate(interactionOption(interaction, "reason"), 500);
+  if (reason.length < 3) {
+    await ephemeral(interaction, "❌ Please provide a closing reason with at least 3 characters.");
+    return;
+  }
+  await defer(interaction);
+  void closeTicket(ticket, reason, interactionUserId(interaction)).catch((error) => log("slash close failed", error));
+}
+
+async function handleCloseRequest(interaction: Interaction): Promise<void> {
+  const ticket = state.tickets.get(interaction.channel_id || "");
+  if (!ticket) {
+    await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+    return;
+  }
+  const userId = interactionUserId(interaction);
+  if (userId !== ticket.ownerId && !isAdministrator(interaction) && !hasTicketStaffAccess(interaction, ticket)) {
+    await ephemeral(interaction, "❌ Only the ticket owner or authorized staff can request closure.");
+    return;
+  }
+  const reason = truncate(interactionOption(interaction, "reason"), 500) || "The ticket owner requested closure.";
+  await ephemeral(interaction, "✅ Your close request was sent to the support team.");
+  const message = await sendMessage(interaction.channel_id!, {
+    content: `${ticketMention(findType(ticket.typeId) || TYPES[0])} <@${ticket.ownerId}>`,
+    embeds: [embed(`🔔 ${BRAND} • Close Request`, 0xf0b429, `${displayName(interaction.member, interaction.user)} requested that this ticket be closed.\n\n**Reason:** ${escapeHtml(reason)}`)]
+  }).catch((error) => {
+    log("close request message failed", error);
+    return null;
+  });
+  if (message?.id) {
+    setTimeout(() => {
+      void discordRequest(`/channels/${interaction.channel_id}/messages/${message.id}`, { method: "DELETE" }, undefined)
+        .catch((error) => log("close request deletion failed", error));
+    }, 15_000);
+  }
+}
+
+function formatUptime(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return `${days}d ${hours}h ${minutes}m ${seconds}s`;
+}
+
+async function handleContext(interaction: Interaction): Promise<void> {
+  const memory = typeof process.memoryUsage === "function" ? process.memoryUsage() : { rss: 0 };
+  const openTickets = state.tickets.size;
+  const uptime = formatUptime(Date.now() - BOT_STARTED_AT);
+  const gatewayConnected = state.gateway?.readyState === 1;
+  const botId = state.applicationId || "Unknown";
+  const commandCount = 4;
+  const embedData = {
+    ...embed(`🍯 ${BRAND} • Bot Context`, 0x5865f2, "Useful bot, server and service information."),
+    fields: [
+      { name: "Version", value: `v${BOT_VERSION}`, inline: true },
+      { name: "Language", value: "TypeScript", inline: true },
+      { name: "Runtime", value: `Bun ${Bun.version}`, inline: true },
+      { name: "Uptime", value: uptime, inline: true },
+      { name: "Gateway", value: gatewayConnected ? "Connected" : "Disconnected", inline: true },
+      { name: "Memory Usage", value: `${Math.round(memory.rss / 1024 / 1024)} MB RSS`, inline: true },
+      { name: "Open Tickets", value: String(openTickets), inline: true },
+      { name: "Ticket Capacity", value: String(cfg().maxTicketsPerGuild), inline: true },
+      { name: "Commands", value: String(commandCount), inline: true },
+      { name: "Bot ID", value: botId, inline: true },
+      { name: "Server ID", value: cfg().guildId, inline: true },
+      { name: "API Version", value: "Discord API v10", inline: true }
+    ],
+    footer: { text: `${BRAND} • Service Status` }
+  };
+  await interactionCallback(interaction, 4, { flags: 64, embeds: [embedData] });
+}
+
 async function handleInteraction(interaction: Interaction): Promise<void> {
   if (state.applicationId && interaction.application_id !== state.applicationId) return;
   const customId = interaction.data?.custom_id || "";
@@ -1554,6 +1645,9 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
   }
   try {
     if (interaction.type === 2 && interaction.data?.name === "setup_panel") await setupPanel(interaction);
+    else if (interaction.type === 2 && interaction.data?.name === "close") await handleCloseCommand(interaction);
+    else if (interaction.type === 2 && interaction.data?.name === "close-request") await handleCloseRequest(interaction);
+    else if (interaction.type === 2 && interaction.data?.name === "context") await handleContext(interaction);
     else if (interaction.type === 3 && customId.startsWith("ticket_open_")) {
       const type = findType(customId.replace("ticket_open_", ""));
       if (type) await interactionCallback(interaction, 9, modal(type));
@@ -1723,11 +1817,35 @@ async function hydrateOpenTickets(): Promise<void> {
   }
 }
 
+function slashOption(name: string, description: string, type = 3, required = false): Json {
+  return { type, name, description, required };
+}
+
 async function registerCommand(): Promise<void> {
-  await discordRequest(`/applications/${state.applicationId}/guilds/${cfg().guildId}/commands`, { method: "PUT" }, [{
-    name: "setup_panel",
-    description: `Open the ${BRAND} support panel (administrators only)`
-  }]);
+  // Guild PUT replaces the complete command set, so stale guild commands are removed automatically.
+  const commands = [
+    {
+      name: "setup_panel",
+      description: `Open the ${BRAND} support panel (administrators only)`
+    },
+    {
+      name: "close",
+      description: "Close the current ticket with a reason",
+      options: [slashOption("reason", "Reason for closing this ticket", 3, true)]
+    },
+    {
+      name: "close-request",
+      description: "Request that the current ticket be closed",
+      options: [slashOption("reason", "Optional reason for requesting closure", 3, false)]
+    },
+    {
+      name: "context",
+      description: `Show ${BRAND} bot status and runtime information`
+    }
+  ];
+  await discordRequest(`/applications/${state.applicationId}/guilds/${cfg().guildId}/commands`, { method: "PUT" }, commands);
+  // Older versions may have registered global commands. This application is intentionally guild-only.
+  await discordRequest(`/applications/${state.applicationId}/commands`, { method: "PUT" }, []);
 }
 
 function gatewaySend(op: number, d: any): void {
