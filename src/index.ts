@@ -196,6 +196,7 @@ const state = {
   resumeUrl: "",
   sequence: null as number | null,
   reconnecting: false,
+  reconnectDelay: 3000,
   heartbeat: null as ReturnType<typeof setInterval> | null,
   heartbeatAck: true,
   claiming: new Set<Snowflake>(),
@@ -207,6 +208,7 @@ const state = {
   memberRoles: new Map<Snowflake, Snowflake[]>(),
   memberNames: new Map<Snowflake, string>(),
   guildRolesLoaded: false,
+  guildRoleLoad: null as Promise<void> | null,
   ticketsHydrated: false,
   hydratingTickets: false
 };
@@ -290,7 +292,8 @@ async function discordRequest(path: string, init: RequestInit = {}, json?: unkno
       } catch {
         // The header is enough when Discord returns a non-JSON rate-limit body.
       }
-      await Bun.sleep(Math.min(15_000, Math.max(250, Math.ceil(retryAfter * 1000))));
+      const retryMs = Number.isFinite(retryAfter) ? Math.min(15_000, Math.max(250, Math.ceil(retryAfter * 1000))) : 1000;
+      await Bun.sleep(retryMs);
       continue;
     }
     throw new Error(`Discord ${response.status} ${path}: ${text.slice(0, 500)}`);
@@ -523,6 +526,7 @@ function parseAnswers(type: TicketType, inputs: Map<string, string>): [string, s
   return type.fields.map((field, index) => {
     const value = (inputs.get(`ticket_form_${type.typeId}_${index}`) || "").trim();
     if (field.required && !value) throw new Error(`Required field "${field.label}" is empty.`);
+    if (value.length > field.maxLength) throw new Error(`Field "${field.label}" is too long.`);
     return [field.label, value];
   });
 }
@@ -575,20 +579,32 @@ async function updateTicketControlMessage(ticket: Ticket): Promise<void> {
 }
 
 async function loadGuildRoles(): Promise<void> {
+  if (state.guildRoleLoad) return state.guildRoleLoad;
+  const load = (async () => {
+    try {
+      const roles = await discordRequest(`/guilds/${cfg().guildId}/roles`);
+      if (!Array.isArray(roles)) throw new Error("Discord returned an invalid role list.");
+      state.guildRoleIds = new Set(roles.map((role) => role.id).filter(Boolean));
+      state.guildRoleNames = new Map(roles.filter((role) => role?.id && role?.name).map((role) => [role.id, String(role.name)] as [Snowflake, string]));
+      state.guildRolePermissions = new Map(
+        roles
+          .filter((role) => role?.id)
+          .map((role) => [role.id, BigInt(role.permissions || "0")] as [Snowflake, bigint])
+      );
+      state.guildRolesLoaded = true;
+    } catch (error) {
+      state.guildRolesLoaded = false;
+      state.guildRoleIds.clear();
+      state.guildRoleNames.clear();
+      state.guildRolePermissions.clear();
+      log(`guild role discovery failed; ticket creation is paused to prevent insecure permissions`, error);
+    }
+  })();
+  state.guildRoleLoad = load;
   try {
-    const roles = await discordRequest(`/guilds/${cfg().guildId}/roles`);
-    if (!Array.isArray(roles)) throw new Error("Discord returned an invalid role list.");
-    state.guildRoleIds = new Set(roles.map((role) => role.id).filter(Boolean));
-    state.guildRoleNames = new Map(roles.filter((role) => role?.id && role?.name).map((role) => [role.id, String(role.name)] as [Snowflake, string]));
-    state.guildRolePermissions = new Map(
-      roles
-        .filter((role) => role?.id)
-        .map((role) => [role.id, BigInt(role.permissions || "0")] as [Snowflake, bigint])
-    );
-    state.guildRolesLoaded = true;
-  } catch (error) {
-    state.guildRolesLoaded = false;
-    log("guild role discovery failed; ticket creation is paused to prevent insecure permissions", error);
+    await load;
+  } finally {
+    if (state.guildRoleLoad === load) state.guildRoleLoad = null;
   }
 }
 
@@ -611,6 +627,18 @@ function renderRoleBadges(roleIds: unknown): string {
   return badges ? "<div class=\"roles\">" + badges + "</div>" : "";
 }
 
+function cacheTranscriptMember(userId: Snowflake, label: string, roles: Snowflake[]): void {
+  if (!state.memberRoles.has(userId) && state.memberRoles.size >= 2000) {
+    const oldest = state.memberRoles.keys().next().value as Snowflake | undefined;
+    if (oldest) {
+      state.memberRoles.delete(oldest);
+      state.memberNames.delete(oldest);
+    }
+  }
+  if (label) state.memberNames.set(userId, label);
+  state.memberRoles.set(userId, roles);
+}
+
 async function hydrateTranscriptMembers(messages: Json[], extraIds: Snowflake[] = []): Promise<void> {
   const ids = [...new Set([...messages.map((message) => String(message.author?.id || "")), ...extraIds])]
     .filter(Boolean)
@@ -622,9 +650,9 @@ async function hydrateTranscriptMembers(messages: Json[], extraIds: Snowflake[] 
         const user = member?.user || {};
         const label = displayName(member, user);
         if (label) state.memberNames.set(userId, label);
-        state.memberRoles.set(userId, Array.isArray(member?.roles) ? member.roles : []);
+        cacheTranscriptMember(userId, label, Array.isArray(member?.roles) ? member.roles : []);
       } catch (error) {
-        state.memberRoles.set(userId, []);
+        cacheTranscriptMember(userId, "", []);
         log(`transcript member lookup failed for ${userId}`, error);
       }
     }));
@@ -687,6 +715,7 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
     await followup(interaction, "⏳ This ticket is already being created. Please wait a moment.");
     return;
   }
+  if (!state.guildRolesLoaded) await loadGuildRoles();
   if (!state.guildRolesLoaded) {
     await followup(interaction, "❌ This ticket type is temporarily unavailable because Discord role access could not be verified.");
     return;
@@ -1241,6 +1270,7 @@ async function handleModalSubmit(interaction: Interaction): Promise<void> {
 }
 
 async function handleInteraction(interaction: Interaction): Promise<void> {
+  if (state.applicationId && interaction.application_id !== state.applicationId) return;
   const customId = interaction.data?.custom_id || "";
   const isDmRating = interaction.guild_id === undefined &&
     (customId.startsWith("rate_") || customId.startsWith("rating_feedback_"));
@@ -1424,7 +1454,8 @@ async function registerCommand(): Promise<void> {
 }
 
 function gatewaySend(op: number, d: any): void {
-  state.gateway?.send(JSON.stringify({ op, d }));
+  if (!state.gateway || state.gateway.readyState !== 1) return;
+  state.gateway.send(JSON.stringify({ op, d }));
 }
 
 function stopHeartbeat(): void {
@@ -1434,6 +1465,7 @@ function stopHeartbeat(): void {
 
 function startHeartbeat(intervalMs: number): void {
   stopHeartbeat();
+  const safeInterval = Number.isFinite(intervalMs) ? Math.min(120_000, Math.max(5_000, intervalMs)) : 45_000;
   state.heartbeatAck = true;
   state.heartbeat = setInterval(() => {
     if (!state.heartbeatAck) {
@@ -1442,7 +1474,7 @@ function startHeartbeat(intervalMs: number): void {
     }
     state.heartbeatAck = false;
     gatewaySend(1, state.sequence);
-  }, intervalMs);
+  }, safeInterval);
 }
 
 async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
@@ -1484,9 +1516,11 @@ async function gatewayDispatch(payload: GatewayPayload): Promise<void> {
   }
 }
 
-function scheduleReconnect(delay = 3000): void {
+function scheduleReconnect(): void {
   if (state.reconnecting) return;
+  const delay = state.reconnectDelay;
   state.reconnecting = true;
+  state.reconnectDelay = Math.min(60_000, Math.max(3_000, state.reconnectDelay * 2));
   setTimeout(() => {
     state.reconnecting = false;
     connectGateway();
@@ -1500,9 +1534,12 @@ function connectGateway(): void {
     : GATEWAY;
   const socket = new WebSocket(url);
   state.gateway = socket;
-  socket.onopen = () => log("gateway socket opened");
+  socket.onopen = () => {
+    state.reconnectDelay = 3000;
+    log("gateway socket opened");
+  };
   socket.onmessage = (event) => {
-    try { void handleGateway(JSON.parse(String(event.data))); }
+    try { void handleGateway(JSON.parse(String(event.data))).catch((error) => log("gateway payload handling failed", error)); }
     catch (error) { log("invalid gateway payload", error); }
   };
   socket.onerror = (event) => log("gateway socket error", event);
