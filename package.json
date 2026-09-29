@@ -1,8 +1,8 @@
 {
   "name": "honeylua",
-  "version": "2.4.0",
+  "version": "2.5.1",
   "private": true,
-  "description": "Low-memory Honeylua support service with an optimized text-and-sticker ticket transcript audit system.",
+  "description": "Low-memory Discord support ticket bot with audit-focused transcripts and admin context tools.",
   "type": "module",
   "scripts": {
     "start": "bun --smol run src/index.ts",
