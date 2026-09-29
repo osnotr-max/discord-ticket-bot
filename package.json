@@ -1,8 +1,8 @@
 {
   "name": "honeylua",
-  "version": "2.2.0",
+  "version": "2.4.0",
   "private": true,
-  "description": "Low-memory Honeylua support service with an optimized v2.2 ticket transcript UI and resilient Discord gateway handling.",
+  "description": "Low-memory Honeylua support service with an optimized text-and-sticker ticket transcript audit system.",
   "type": "module",
   "scripts": {
     "start": "bun --smol run src/index.ts",

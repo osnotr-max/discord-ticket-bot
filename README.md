@@ -104,3 +104,9 @@ repository requires it; this implementation does not request it. Enable
 
 After startup, an administrator can use `/setup_panel` in the configured
 server.
+
+### Transcript media
+Transcripts now include a complete offline `transcript-<ticket>.tar.gz` bundle. Discord attachments are downloaded while the ticket is being closed and stored locally inside the archive, so images, GIFs, videos and audio do not depend on expiring Discord CDN URLs. The archive contains `index.html` plus a `media/` directory. A standalone HTML copy is also attached when it is small enough.
+
+### Close reason
+Closing a ticket opens a required reason modal. The exact reason is stored in the transcript and close log.
