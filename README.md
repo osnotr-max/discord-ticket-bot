@@ -1,3 +1,11 @@
+## Transcript 2.2.0
+
+- Message author names are always rendered visibly, with optional @username.
+- Member role badges are removed from normal messages; role names remain rendered when a role is actually mentioned.
+- Ticket members can send images/attachments and use embedded links.
+- Temporary claim/release/closing bot notices are excluded from saved transcripts.
+- Mobile transcript layout is more compact and readable.
+
 # Honeylua Support
 
 Honeylua' Discord support service is built in **TypeScript running on Bun**. It uses Bun's
