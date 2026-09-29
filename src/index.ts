@@ -473,7 +473,7 @@ function permissionOverwrite(
 function ticketPermissionOverwrites(ticket: Ticket, claimedBy?: Snowflake): Json[] {
   const type = findType(ticket.typeId);
   const view = PERMISSIONS.VIEW_CHANNEL;
-  const memberAccess = view | PERMISSIONS.SEND_MESSAGES | PERMISSIONS.READ_MESSAGE_HISTORY;
+  const memberAccess = view | PERMISSIONS.SEND_MESSAGES | PERMISSIONS.READ_MESSAGE_HISTORY | PERMISSIONS.EMBED_LINKS | PERMISSIONS.ATTACH_FILES;
   const staffAccess = memberAccess | PERMISSIONS.MANAGE_MESSAGES;
   const botAccess = staffAccess |
     PERMISSIONS.MANAGE_CHANNELS |
@@ -718,7 +718,16 @@ function cacheTranscriptMember(userId: Snowflake, label: string, roles: Snowflak
 }
 
 async function hydrateTranscriptMembers(messages: Json[], extraIds: Snowflake[] = []): Promise<void> {
-  const ids = [...new Set([...messages.map((message) => String(message.author?.id || "")), ...extraIds])]
+  const mentionedUserIds = messages.flatMap((message) => {
+    const content = String(message.content || "");
+    return [...content.matchAll(/<@!?(\d{15,25})>/g)].map((match) => match[1]);
+  });
+  const ids = [...new Set([
+    ...messages.map((message) => String(message.author?.id || "")),
+    ...messages.map((message) => String(message.referenced_message?.author?.id || "")),
+    ...mentionedUserIds,
+    ...extraIds
+  ])]
     .filter(Boolean)
     .filter((id) => !state.memberRoles.has(id));
   for (let offset = 0; offset < ids.length; offset += 5) {
@@ -1020,6 +1029,15 @@ function formatDuration(ms: number): string {
   return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
 }
 
+function isTemporaryTranscriptMessage(message: Json): boolean {
+  if (!message?.author?.bot) return false;
+  const embeds = Array.isArray(message.embeds) ? message.embeds : [];
+  return embeds.some((item: Json) => {
+    const title = String(item?.title || "").toLowerCase();
+    return title.includes("ticket claimed") || title.includes("ticket released") || title.includes("closing");
+  });
+}
+
 async function fetchMessages(channelId: Snowflake, extraMemberIds: Snowflake[] = []): Promise<string[]> {
   const messages: string[] = [];
   let before = "";
@@ -1030,8 +1048,9 @@ async function fetchMessages(channelId: Snowflake, extraMemberIds: Snowflake[] =
     // Render and release each REST page immediately. Keeping 5,000 raw
     // Discord message objects alive while also building HTML can cause a
     // large transient memory spike on a small server.
-    await hydrateTranscriptMembers(current, extraMemberIds);
-    messages.push(...current.map(renderMessage));
+    const transcriptMessages = current.filter((message: Json) => !isTemporaryTranscriptMessage(message));
+    await hydrateTranscriptMembers(transcriptMessages, extraMemberIds);
+    messages.push(...transcriptMessages.map(renderMessage));
     if (current.length < 100) break;
     before = current[current.length - 1].id;
     await Bun.sleep(cfg().transcriptPageDelayMs);
@@ -1149,7 +1168,7 @@ function renderTranscriptBody(content: string): string {
     const roleName = state.guildRoleNames.get(roleId);
     return roleName ? `<span class="mention">@${escapeHtml(roleName)}</span>` : `<span class="mention">@Role</span>`;
   });
-  body = body.replace(/&lt;@!?(\d+)&gt;/g, (_match, userId) => `<span class="mention">@${escapeHtml(state.memberNames.get(userId) || "user")}</span>`);
+  body = body.replace(/&lt;@!?(\d+)&gt;/g, (_match, userId) => `<span class="mention">@${escapeHtml(state.memberNames.get(userId) || "Unknown user")}</span>`);
   body = body.replace(/&lt;#(\d+)&gt;/g, `<span class="mention">#channel</span>`);
   body = body.replace(/&lt;t:(\d+)(?::([tTdDfFR]))?&gt;/g, (_match, seconds, style) => `<span class="mention">${escapeHtml(formatTranscriptDate(Number(seconds) * 1000))}</span>`);
   body = body.replace(/(https?:\/\/[^\s<&]+)/g, `<a href="$1" target="_blank" rel="noreferrer" style="color:var(--accent-strong)">$1</a>`);
@@ -1204,8 +1223,13 @@ function renderReactions(reactions: unknown): string {
 
 function renderMessage(message: Json): string {
   const author = message.author || {};
-  const avatar = author.avatar ? `https://cdn.discordapp.com/avatars/${author.id}/${author.avatar}.png?size=64` : "https://cdn.discordapp.com/embed/avatars/0.png";
-  const name = author.global_name || author.username || "user";
+  const authorId = String(author.id || "");
+  const avatar = author.avatar
+    ? `https://cdn.discordapp.com/avatars/${authorId}/${author.avatar}.png?size=64`
+    : "https://cdn.discordapp.com/embed/avatars/0.png";
+  const cachedName = authorId ? state.memberNames.get(authorId) : "";
+  const name = String(author.global_name || author.username || cachedName || "Unknown user").trim() || "Unknown user";
+  const username = String(author.username || "").trim();
   const timestamp = String(message.timestamp || "");
   const attachments = Array.isArray(message.attachments) ? message.attachments : [];
   const attachmentHtml = attachments.map((attachment: Json) => renderAttachment(attachment)).join("");
@@ -1218,10 +1242,12 @@ function renderMessage(message: Json): string {
       ? "<span class=\"muted\">Media-only message</span>"
       : "<span class=\"muted\">No text content</span>";
   const botBadge = author.bot ? "<span class=\"badge\">BOT</span>" : "";
-  const roles = renderRoleBadges(state.memberRoles.get(String(author.id || "")) || []);
-  const reply = message.referenced_message?.author ? `<div class="reply">Replying to <strong>${escapeHtml(message.referenced_message.author.global_name || message.referenced_message.author.username || "user")}</strong></div>` : "";
+  const usernameHtml = username && username !== name ? `<div class=\"username-line\"><span class=\"username\">@${escapeHtml(username)}</span></div>` : "";
+  const replyAuthor = message.referenced_message?.author || {};
+  const replyName = String(replyAuthor.global_name || replyAuthor.username || state.memberNames.get(String(replyAuthor.id || "")) || "Unknown user");
+  const reply = message.referenced_message?.author ? `<div class=\"reply\"><span>Replying to</span> <strong>${escapeHtml(replyName)}</strong></div>` : "";
   const reactions = renderReactions(message.reactions);
-  return `<article class="msg${author.bot ? " bot" : ""}" data-message-id="${escapeHtml(String(message.id || ""))}" data-date="${escapeHtml(timestamp.slice(0, 10))}"><div class="message-head"><img class="avatar" src="${escapeHtml(avatar)}" alt="" loading="lazy" referrerpolicy="no-referrer"><div class="identity-wrap"><div class="identity"><span class="author">${escapeHtml(name)}</span>${botBadge}<span class="uid">${escapeHtml(author.id || "")}</span></div>${roles}</div><div class="message-meta"><time class="ts" datetime="${escapeHtml(timestamp)}">${escapeHtml(formatTranscriptTime(timestamp))}</time></div></div>${reply}<div class="body">${body}</div>${attachmentHtml || stickerHtml ? `<div class="attachments">${attachmentHtml}${stickerHtml}</div>` : ""}${embedHtml ? `<div class="embed-list">${embedHtml}</div>` : ""}${reactions}</article>`;
+  return `<article class=\"msg${author.bot ? " bot" : ""}\" data-message-id=\"${escapeHtml(String(message.id || ""))}\" data-date=\"${escapeHtml(timestamp.slice(0, 10))}\"><div class=\"message-head\"><img class=\"avatar\" src=\"${escapeHtml(avatar)}\" alt=\"${escapeHtml(name)}\" loading=\"lazy\" referrerpolicy=\"no-referrer\"><div class=\"identity-wrap\"><div class=\"identity\"><span class=\"author\">${escapeHtml(name)}</span>${botBadge}</div>${usernameHtml}</div><div class=\"message-meta\"><time class=\"ts\" datetime=\"${escapeHtml(timestamp)}\">${escapeHtml(formatTranscriptTime(timestamp))}</time></div></div>${reply}<div class=\"body\">${body}</div>${attachmentHtml || stickerHtml ? `<div class=\"attachments\">${attachmentHtml}${stickerHtml}</div>` : ""}${embedHtml ? `<div class=\"embed-list\">${embedHtml}</div>` : ""}${reactions}</article>`;
 }
 
 function transcriptByteLength(html: string): number {
