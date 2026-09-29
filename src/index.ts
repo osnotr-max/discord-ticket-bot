@@ -52,6 +52,7 @@ interface Config {
   requestTimeoutMs: number;
   transcriptPageDelayMs: number;
   maxTranscriptBytes: number;
+  maxTranscriptBundleBytes: number;
 }
 
 interface Ticket {
@@ -266,7 +267,9 @@ function loadConfig(): Config {
     transcriptPageDelayMs: Math.min(2_000, Math.max(100, integerEnv("TRANSCRIPT_PAGE_DELAY_MS", 250))),
     // Keep generated HTML below Discord's commonly available upload ceiling.
     // The transcript will gracefully keep the newest messages if this is exceeded.
-    maxTranscriptBytes: Math.min(24 * 1024 * 1024, Math.max(1 * 1024 * 1024, integerEnv("MAX_TRANSCRIPT_BYTES", 20 * 1024 * 1024)))
+    maxTranscriptBytes: Math.min(18 * 1024 * 1024, Math.max(1 * 1024 * 1024, integerEnv("MAX_TRANSCRIPT_BYTES", 18 * 1024 * 1024))),
+    // Keep the complete offline bundle below Discord's broadly available free upload limit.
+    maxTranscriptBundleBytes: Math.min(19 * 1024 * 1024, Math.max(2 * 1024 * 1024, integerEnv("MAX_TRANSCRIPT_BUNDLE_BYTES", 19 * 1024 * 1024)))
   };
 }
 
@@ -328,11 +331,17 @@ async function discordRequest(path: string, init: RequestInit = {}, json?: unkno
   throw new Error(`Discord request exhausted retries: ${path}`);
 }
 
-async function sendMessage(channelId: Snowflake, payload: Json, file?: { name: string; content: string }): Promise<Json> {
-  if (!file) return discordRequest(`/channels/${channelId}/messages`, { method: "POST" }, payload);
+type UploadFile = { name: string; content: string | Uint8Array; contentType?: string };
+
+async function sendMessage(channelId: Snowflake, payload: Json, files?: UploadFile | UploadFile[]): Promise<Json> {
+  if (!files) return discordRequest(`/channels/${channelId}/messages`, { method: "POST" }, payload);
+  const list = Array.isArray(files) ? files : [files];
   const form = new FormData();
   form.append("payload_json", JSON.stringify(payload));
-  form.append("files[0]", new Blob([file.content], { type: "text/html; charset=utf-8" }), file.name);
+  list.forEach((file, index) => {
+    const content = typeof file.content === "string" ? new TextEncoder().encode(file.content) : file.content;
+    form.append(`files[${index}]`, new Blob([content], { type: file.contentType || "application/octet-stream" }), file.name);
+  });
   return discordRequest(`/channels/${channelId}/messages`, { method: "POST", body: form });
 }
 
@@ -690,20 +699,6 @@ function memberDisplayLabel(userId: Snowflake): string {
   return state.memberNames.get(userId) || userId;
 }
 
-function renderRoleBadges(roleIds: unknown): string {
-  if (!Array.isArray(roleIds)) return "";
-  const badges = roleIds
-    .filter((roleId) => roleId && roleId !== cfg().guildId)
-    .map((roleId) => {
-      const name = state.guildRoleNames.get(String(roleId));
-      if (!name) return "";
-      return "<span class=\"role-badge\" title=\"" + escapeHtml(name) + "\">@" + escapeHtml(name) + "</span>";
-    })
-    .filter(Boolean)
-    .slice(0, 6)
-    .join("");
-  return badges ? "<div class=\"roles\">" + badges + "</div>" : "";
-}
 
 function cacheTranscriptMember(userId: Snowflake, label: string, roles: Snowflake[]): void {
   if (!state.memberRoles.has(userId) && state.memberRoles.size >= 2000) {
@@ -774,6 +769,7 @@ function actionKey(interaction: Interaction): string | undefined {
   }
   if (interaction.type === 5) {
     if (customId.startsWith("rating_feedback_")) return "rating_feedback";
+    if (customId.startsWith("ticket_close_reason_")) return "ticket_close_reason";
     if (customId.startsWith("ticket_form_")) return "ticket_form";
   }
   return undefined;
@@ -1038,25 +1034,53 @@ function isTemporaryTranscriptMessage(message: Json): boolean {
   });
 }
 
-async function fetchMessages(channelId: Snowflake, extraMemberIds: Snowflake[] = []): Promise<string[]> {
-  const messages: string[] = [];
+interface TranscriptCapture {
+  messages: string[];
+}
+
+
+function renderAttachment(attachment: Json): string {
+  const filename = String(attachment.filename || "Attachment");
+  const size = formatBytes(attachment.size);
+  const contentType = String(attachment.content_type || "").toLowerCase();
+  const icon = contentType.startsWith("image/") ? "🖼️" : contentType.startsWith("video/") ? "🎬" : contentType.startsWith("audio/") ? "🎵" : "📎";
+  const kind = contentType.startsWith("image/") ? "Image attachment" : contentType.startsWith("video/") ? "Video attachment" : contentType.startsWith("audio/") ? "Audio attachment" : "File attachment";
+  const sizeHtml = size ? `<span class="attachment-size">${escapeHtml(kind)} · ${escapeHtml(size)}</span>` : `<span class="attachment-size">${escapeHtml(kind)}</span>`;
+  return `<div class="attachment"><span class="attachment-icon">${icon}</span><div class="attachment-info"><span class="attachment-name">${escapeHtml(filename)}</span>${sizeHtml}</div></div>`;
+}
+
+function stickerUrl(sticker: Json): string {
+  const id = String(sticker.id || "").trim();
+  const formatType = Number(sticker.format_type);
+  if (!/^\d{15,25}$/.test(id)) return "#";
+  if (formatType === 1 || formatType === 2) return `https://cdn.discordapp.com/stickers/${id}.png`;
+  if (formatType === 4) return `https://cdn.discordapp.com/stickers/${id}.gif`;
+  return "#";
+}
+
+function renderSticker(sticker: Json): string {
+  const url = stickerUrl(sticker);
+  const name = String(sticker.name || "Discord sticker");
+  if (url === "#") return `<div class="attachment"><span class="attachment-icon">🎨</span><div class="attachment-info"><span class="attachment-name">${escapeHtml(name)}</span><span class="attachment-size">Sticker</span></div></div>`;
+  return `<div class="sticker"><a class="sticker-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img class="sticker-image" src="${escapeHtml(url)}" alt="${escapeHtml(name)}" loading="lazy" referrerpolicy="no-referrer"></a><span class="sticker-name">${escapeHtml(name)}</span></div>`;
+}
+
+async function fetchMessages(channelId: Snowflake, extraMemberIds: Snowflake[] = []): Promise<TranscriptCapture> {
+  const rawMessages: Json[] = [];
   let before = "";
   for (let page = 0; page < cfg().maxTranscriptPages; page++) {
     const query = before ? `?limit=100&before=${before}` : "?limit=100";
     const current = await discordRequest(`/channels/${channelId}/messages${query}`);
     if (!Array.isArray(current) || current.length === 0) break;
-    // Render and release each REST page immediately. Keeping 5,000 raw
-    // Discord message objects alive while also building HTML can cause a
-    // large transient memory spike on a small server.
-    const transcriptMessages = current.filter((message: Json) => !isTemporaryTranscriptMessage(message));
-    await hydrateTranscriptMembers(transcriptMessages, extraMemberIds);
-    messages.push(...transcriptMessages.map(renderMessage));
+    rawMessages.push(...current.filter((message: Json) => !isTemporaryTranscriptMessage(message)));
     if (current.length < 100) break;
     before = current[current.length - 1].id;
     await Bun.sleep(cfg().transcriptPageDelayMs);
   }
-  messages.reverse();
-  return messages;
+
+  await hydrateTranscriptMembers(rawMessages, extraMemberIds);
+  const messages = rawMessages.map(renderMessage).reverse();
+  return { messages };
 }
 
 const TRANSCRIPT_DATE_FORMATTER = new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeStyle: "short" });
@@ -1072,7 +1096,7 @@ const TRANSCRIPT_CSS = `<style>
 .details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.detail{padding:11px 12px;border:1px solid var(--line-soft);border-radius:10px;background:rgba(0,0,0,.12)}.detail-label{display:block;color:var(--muted-2);font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.detail-value{display:block;margin-top:4px;word-break:break-word}.mono{font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#c8cdd5}.copy-id{display:inline-flex;align-items:center;gap:5px;margin-left:5px;padding:2px 6px;border:1px solid var(--line);border-radius:5px;background:var(--surface-3);color:var(--muted);font-size:9px;cursor:pointer}.copy-id:hover{color:var(--text)}
 .people{display:grid;gap:8px}.person{display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--line-soft);border-radius:10px;background:rgba(0,0,0,.10)}.person-avatar{display:grid;place-items:center;flex:0 0 auto;width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:var(--surface-4);color:var(--accent-strong);font-weight:850}.person-main{min-width:0}.person-label{display:block;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.person-sub{display:block;margin-top:1px;color:var(--muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.person-role{margin-left:auto;padding:3px 6px;border-radius:6px;background:rgba(240,180,41,.09);color:var(--accent-strong);font-size:9px;font-weight:800}
 .answers{display:grid;gap:9px}.answer{display:grid;grid-template-columns:28px 1fr;gap:10px;padding:12px;border:1px solid var(--line-soft);border-radius:11px;background:rgba(0,0,0,.11)}.answer-index{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;background:rgba(240,180,41,.11);color:var(--accent-strong);font-size:11px;font-weight:900}.answer-label{color:var(--muted);font-size:11px;font-weight:800}.answer-value{margin-top:3px;white-space:pre-wrap;word-break:break-word}.empty{padding:18px;border:1px dashed var(--line);border-radius:10px;color:var(--muted);text-align:center}
-.timeline{position:relative}.date-separator{display:flex;align-items:center;gap:10px;margin:20px 0 11px;color:var(--muted-2);font-size:10px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}.date-separator:before,.date-separator:after{content:"";height:1px;flex:1;background:var(--line-soft)}.msg{position:relative;padding:12px 13px;border:1px solid var(--line-soft);border-radius:12px;background:linear-gradient(135deg,rgba(255,255,255,.025),rgba(0,0,0,.12));margin:0 0 8px;transition:border-color .15s,background .15s}.msg:hover{border-color:rgba(240,180,41,.18);background:linear-gradient(135deg,rgba(255,255,255,.035),rgba(0,0,0,.13))}.msg.bot{border-left:2px solid rgba(114,137,218,.7)}.msg.highlight{border-color:rgba(240,180,41,.55);box-shadow:0 0 0 3px rgba(240,180,41,.06)}.message-head{display:flex;align-items:flex-start;gap:9px}.avatar{width:34px;height:34px;flex:0 0 auto;border:1px solid var(--line);border-radius:50%;background:var(--surface-4);object-fit:cover}.identity-wrap{min-width:0;flex:1}.identity{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}.author{font-weight:850;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.uid{color:var(--muted-2);font:9px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.badge{padding:2px 5px;border-radius:4px;background:#5865f2;color:#fff;font-size:8px;font-weight:900;letter-spacing:.06em}.roles{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}.role-badge,.mention{display:inline-block;padding:2px 6px;border:1px solid rgba(240,180,41,.24);border-radius:5px;background:rgba(240,180,41,.08);color:#d9b75f;font-size:9px;font-weight:750}.message-meta{display:flex;align-items:center;gap:8px;flex:0 0 auto;color:var(--muted-2);font-size:10px}.ts{white-space:nowrap}.body{margin:8px 0 0 43px;color:#d9dde3;white-space:normal;word-break:break-word}.body code{padding:2px 4px;border-radius:4px;background:#0b0c0f;color:#f0f2f5;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.body .codeblock{display:block;margin:7px 0;padding:10px 11px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#0b0c0f;color:#d9dde3;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre}.reply{margin:8px 0 0 43px;padding:6px 9px;border-left:2px solid var(--blue);border-radius:0 6px 6px 0;background:rgba(114,137,218,.06);color:var(--muted);font-size:10px}.attachments,.embed-list{display:grid;gap:8px;margin:9px 0 0 43px}.attachment{display:flex;align-items:center;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:rgba(0,0,0,.14);word-break:break-word}.attachment-icon{display:grid;place-items:center;width:28px;height:28px;flex:0 0 auto;border-radius:7px;background:var(--surface-3);font-size:14px}.attachment-info{min-width:0;flex:1}.attachment-name{display:block;font-weight:750;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.attachment-size{display:block;color:var(--muted-2);font-size:10px}.attachment-open{padding:5px 7px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:9px;font-weight:800}.attachment-open:hover{color:var(--text)}.attachment-media-link{display:block}.attachment-image,.sticker-image{display:block;width:auto;max-width:min(680px,100%);max-height:420px;border:1px solid var(--line);border-radius:10px;object-fit:contain;background:#08090b}.sticker-image{max-width:250px;max-height:250px}.attachment-video{display:block;width:min(720px,100%);max-height:440px;border:1px solid var(--line);border-radius:10px;background:#08090b}.attachment-audio{display:block;width:min(680px,100%)}.attachment-media{display:grid;gap:6px}.attachment-fallback{color:var(--muted);font-size:10px}.embed-card{overflow:hidden;padding:12px 13px;border:1px solid rgba(88,101,242,.28);border-left:3px solid #7289da;border-radius:9px;background:linear-gradient(135deg,rgba(88,101,242,.10),rgba(88,101,242,.025))}.embed-author{color:#aeb8ff;font-size:9px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}.embed-title{display:block;margin-top:2px;font-size:14px;font-weight:850}.embed-description{margin-top:5px;color:#d9dce3;white-space:pre-wrap;word-break:break-word}.embed-field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:9px}.embed-field{padding:8px;border-radius:7px;background:rgba(0,0,0,.14)}.embed-field strong{display:block;color:#c7cbff;font-size:9px}.embed-field span{display:block;margin-top:2px;white-space:pre-wrap;word-break:break-word;font-size:11px}.embed-image{display:block;width:100%;max-height:380px;margin-top:10px;border-radius:7px;object-fit:contain;background:#08090b}.reactions{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 0 43px}.reaction{padding:3px 7px;border:1px solid var(--line);border-radius:7px;background:var(--surface-3);color:var(--muted);font-size:10px}.reaction strong{color:var(--text)}
+.timeline{position:relative}.date-separator{display:flex;align-items:center;gap:10px;margin:20px 0 11px;color:var(--muted-2);font-size:10px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}.date-separator:before,.date-separator:after{content:"";height:1px;flex:1;background:var(--line-soft)}.msg{position:relative;padding:12px 13px;border:1px solid var(--line-soft);border-radius:12px;background:linear-gradient(135deg,rgba(255,255,255,.025),rgba(0,0,0,.12));margin:0 0 8px;transition:border-color .15s,background .15s}.msg:hover{border-color:rgba(240,180,41,.18);background:linear-gradient(135deg,rgba(255,255,255,.035),rgba(0,0,0,.13))}.msg.bot{border-left:2px solid rgba(114,137,218,.7)}.msg.highlight{border-color:rgba(240,180,41,.55);box-shadow:0 0 0 3px rgba(240,180,41,.06)}.message-head{display:flex;align-items:flex-start;gap:9px}.avatar{width:34px;height:34px;flex:0 0 auto;border:1px solid var(--line);border-radius:50%;background:var(--surface-4);object-fit:cover}.avatar-initial{display:grid;place-items:center;color:var(--accent-strong);font-weight:850;font-size:12px}.sticker{display:inline-flex;align-items:center;gap:8px;width:max-content;max-width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:9px;background:rgba(0,0,0,.12)}.sticker-image{width:64px;height:64px;object-fit:contain}.sticker-name{color:var(--muted);font-size:10px}.sticker-link{display:flex}.custom-emoji{padding:1px 3px;border-radius:4px;background:rgba(255,255,255,.05);color:var(--text);font-size:12px}.identity-wrap{min-width:0;flex:1}.identity{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}.author{font-weight:850;max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.uid{color:var(--muted-2);font:9px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.badge{padding:2px 5px;border-radius:4px;background:#5865f2;color:#fff;font-size:8px;font-weight:900;letter-spacing:.06em}.mention{display:inline-block;padding:2px 6px;border:1px solid rgba(240,180,41,.24);border-radius:5px;background:rgba(240,180,41,.08);color:#d9b75f;font-size:9px;font-weight:750}.message-meta{display:flex;align-items:center;gap:8px;flex:0 0 auto;color:var(--muted-2);font-size:10px}.ts{white-space:nowrap}.body{margin:8px 0 0 43px;color:#d9dde3;white-space:normal;word-break:break-word}.body code{padding:2px 4px;border-radius:4px;background:#0b0c0f;color:#f0f2f5;font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.body .codeblock{display:block;margin:7px 0;padding:10px 11px;overflow:auto;border:1px solid var(--line);border-radius:8px;background:#0b0c0f;color:#d9dde3;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre}.reply{margin:8px 0 0 43px;padding:6px 9px;border-left:2px solid var(--blue);border-radius:0 6px 6px 0;background:rgba(114,137,218,.06);color:var(--muted);font-size:10px}.attachments,.embed-list{display:grid;gap:8px;margin:9px 0 0 43px}.attachment{display:flex;align-items:center;gap:9px;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:rgba(0,0,0,.14);word-break:break-word}.attachment-icon{display:grid;place-items:center;width:28px;height:28px;flex:0 0 auto;border-radius:7px;background:var(--surface-3);font-size:14px}.attachment-info{min-width:0;flex:1}.attachment-name{display:block;font-weight:750;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.attachment-size{display:block;color:var(--muted-2);font-size:10px}.attachment-open{padding:5px 7px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:9px;font-weight:800}.attachment-open:hover{color:var(--text)}.attachment-media-link{display:block}.attachment-image,.sticker-image{display:block;width:auto;max-width:min(680px,100%);max-height:420px;border:1px solid var(--line);border-radius:10px;object-fit:contain;background:#08090b}.sticker-image{max-width:250px;max-height:250px}.attachment-video{display:block;width:min(720px,100%);max-height:440px;border:1px solid var(--line);border-radius:10px;background:#08090b}.attachment-audio{display:block;width:min(680px,100%)}.attachment-media{display:grid;gap:6px}.attachment-fallback{color:var(--muted);font-size:10px}.embed-card{overflow:hidden;padding:12px 13px;border:1px solid rgba(88,101,242,.28);border-left:3px solid #7289da;border-radius:9px;background:linear-gradient(135deg,rgba(88,101,242,.10),rgba(88,101,242,.025))}.embed-author{color:#aeb8ff;font-size:9px;font-weight:850;letter-spacing:.08em;text-transform:uppercase}.embed-title{display:block;margin-top:2px;font-size:14px;font-weight:850}.embed-description{margin-top:5px;color:#d9dce3;white-space:pre-wrap;word-break:break-word}.embed-field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:9px}.embed-field{padding:8px;border-radius:7px;background:rgba(0,0,0,.14)}.embed-field strong{display:block;color:#c7cbff;font-size:9px}.embed-field span{display:block;margin-top:2px;white-space:pre-wrap;word-break:break-word;font-size:11px}.embed-image{display:block;width:100%;max-height:380px;margin-top:10px;border-radius:7px;object-fit:contain;background:#08090b}.reactions{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 0 43px}.reaction{padding:3px 7px;border:1px solid var(--line);border-radius:7px;background:var(--surface-3);color:var(--muted);font-size:10px}.reaction strong{color:var(--text)}
 .footer{padding:22px 0 0;color:var(--muted-2);text-align:center;font-size:10px}.footer strong{color:var(--accent-strong)}.hidden{display:none!important}.no-results{display:none;padding:20px;color:var(--muted);text-align:center}.no-results.show{display:block}
 @media(max-width:860px){.grid{grid-template-columns:1fr}.search{width:min(260px,42vw)}}@media(max-width:650px){.shell{padding:12px 10px 38px}.topbar{margin:-12px -10px 14px;padding:10px}.brand span:not(.brand-mark){display:none}.toolbar{width:100%}.search{width:100%;max-width:none}.tool-btn{display:none}.hero{padding:20px 17px}.hero-row{display:block}.status{margin-top:14px}.stats{grid-template-columns:repeat(2,1fr)}.card{padding:15px}.details{grid-template-columns:1fr}.card-heading{display:block}.count{display:inline-block;margin-top:8px}.message-meta{width:100%;margin-left:43px}.body,.reply,.attachments,.embed-list,.reactions{margin-left:43px}.embed-field-grid{grid-template-columns:1fr}.author{max-width:160px}.uid{display:none}}
 </style>`;
@@ -1113,7 +1137,7 @@ function formatBytes(value: unknown): string {
 
 function transcriptUrl(value: unknown): string {
   const url = String(value || "");
-  return url.startsWith("https://") || url.startsWith("http://") ? url : "#";
+  return url.startsWith("https://") || url.startsWith("http://") || url.startsWith("media/") ? url : "#";
 }
 
 function transcriptStat(label: string, value: string): string {
@@ -1138,10 +1162,10 @@ function renderTranscriptEmbed(embedData: Json): string {
   const description = String(embedData.description || "").trim();
   const author = String(embedData.author?.name || "").trim();
   const embedUrl = transcriptUrl(embedData.url);
-  const imageUrl = transcriptUrl(embedData.image?.url || embedData.thumbnail?.url);
+  const hasImage = Boolean(embedData.image?.url || embedData.thumbnail?.url);
   const fields = Array.isArray(embedData.fields) ? embedData.fields : [];
   const footer = String(embedData.footer?.text || "").trim();
-  if (!title && !description && !author && !fields.length && imageUrl === "#" && !footer) return "";
+  if (!title && !description && !author && !fields.length && !footer && !hasImage) return "";
   let html = "<div class=\"embed-card\">";
   if (author) html += `<div class="embed-author">${escapeHtml(author)}</div>`;
   if (title) html += embedUrl !== "#" ? `<a class="embed-title" href="${escapeHtml(embedUrl)}" target="_blank" rel="noreferrer">${escapeHtml(title)}</a>` : `<div class="embed-title">${escapeHtml(title)}</div>`;
@@ -1151,7 +1175,7 @@ function renderTranscriptEmbed(embedData: Json): string {
     for (const field of fields) html += `<div class="embed-field"><strong>${escapeHtml(String(field.name || "Field"))}</strong><span>${escapeHtml(String(field.value || ""))}</span></div>`;
     html += `</div>`;
   }
-  if (imageUrl !== "#") html += `<a href="${escapeHtml(imageUrl)}" target="_blank" rel="noreferrer"><img class="embed-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(title || "Embed image")}" loading="lazy" referrerpolicy="no-referrer"></a>`;
+  if (hasImage) html += `<div class="attachment"><span class="attachment-icon">🖼️</span><div class="attachment-info"><span class="attachment-name">Embedded image</span><span class="attachment-size">Image preview omitted from transcript</span></div></div>`;
   if (footer) html += `<div class="attachment-fallback">${escapeHtml(footer)}</div>`;
   return html + "</div>";
 }
@@ -1160,9 +1184,8 @@ function renderTranscriptBody(content: string): string {
   let body = escapeHtml(content);
   body = body.replace(/```([\s\S]*?)```/g, (_match, code) => `<code class="codeblock">${code.trim()}</code>`);
   body = body.replace(/`([^`\n]+)`/g, "<code>$1</code>");
-  body = body.replace(/&lt;(a?):([a-zA-Z0-9_~]+):(\d{15,25})&gt;/g, (_match, animated, name, id) => {
-    const ext = animated ? "gif" : "png";
-    return `<img src="https://cdn.discordapp.com/emojis/${id}.${ext}?size=32" alt=":${escapeHtml(name)}:" title=":${escapeHtml(name)}:" style="width:20px;height:20px;vertical-align:-5px;object-fit:contain">`;
+  body = body.replace(/&lt;(a?):([a-zA-Z0-9_~]+):(\d{15,25})&gt;/g, (_match, _animated, name, _id) => {
+    return `<span class="custom-emoji" title=":${escapeHtml(name)}:">:${escapeHtml(name)}:</span>`;
   });
   body = body.replace(/&lt;@&amp;(\d+)&gt;/g, (_match, roleId) => {
     const roleName = state.guildRoleNames.get(roleId);
@@ -1174,41 +1197,6 @@ function renderTranscriptBody(content: string): string {
   body = body.replace(/(https?:\/\/[^\s<&]+)/g, `<a href="$1" target="_blank" rel="noreferrer" style="color:var(--accent-strong)">$1</a>`);
   body = body.replaceAll(String.fromCharCode(10), "<br>");
   return body;
-}
-
-function renderAttachment(attachment: Json): string {
-  const url = transcriptUrl(attachment.url || attachment.proxy_url);
-  const filename = String(attachment.filename || "Attachment");
-  const size = formatBytes(attachment.size);
-  const contentType = String(attachment.content_type || "").toLowerCase();
-  const safeUrl = escapeHtml(url);
-  const safeFilename = escapeHtml(filename);
-  const sizeHtml = size ? `<span class="attachment-size">${escapeHtml(size)}</span>` : `<span class="attachment-size">Attachment</span>`;
-  const open = url !== "#" ? `<a class="attachment-open" href="${safeUrl}" target="_blank" rel="noreferrer">Open</a>` : "";
-  if (url === "#") return `<div class="attachment"><span class="attachment-icon">📎</span><div class="attachment-info"><span class="attachment-name">${safeFilename}</span>${sizeHtml}</div></div>`;
-  const isImage = contentType.startsWith("image/") || /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(filename);
-  if (isImage) return `<div class="attachment-media"><a class="attachment-media-link" href="${safeUrl}" target="_blank" rel="noreferrer"><img data-fallback="1" class="attachment-image" src="${safeUrl}" alt="${safeFilename}" loading="lazy" referrerpolicy="no-referrer"><div class="attachment hidden">🖼️ ${safeFilename}</div></a><div class="attachment"><span class="attachment-icon">🖼️</span><div class="attachment-info"><span class="attachment-name">${safeFilename}</span>${sizeHtml}</div>${open}</div></div>`;
-  const isVideo = contentType.startsWith("video/") || /\.(mp4|webm|mov|m4v|ogv)$/i.test(filename);
-  if (isVideo) return `<div class="attachment-media"><video class="attachment-video" controls preload="metadata" playsinline src="${safeUrl}"></video><div class="attachment"><span class="attachment-icon">🎬</span><div class="attachment-info"><span class="attachment-name">${safeFilename}</span>${sizeHtml}</div>${open}</div></div>`;
-  const isAudio = contentType.startsWith("audio/") || /\.(mp3|wav|ogg|oga|m4a|aac|flac|opus)$/i.test(filename);
-  if (isAudio) return `<div class="attachment-media"><audio class="attachment-audio" controls preload="metadata" src="${safeUrl}"></audio><div class="attachment"><span class="attachment-icon">🎵</span><div class="attachment-info"><span class="attachment-name">${safeFilename}</span>${sizeHtml}</div>${open}</div></div>`;
-  return `<div class="attachment"><span class="attachment-icon">📎</span><div class="attachment-info"><span class="attachment-name">${safeFilename}</span>${sizeHtml}</div>${open}</div>`;
-}
-
-function stickerUrl(sticker: Json): string {
-  const id = String(sticker.id || "").trim();
-  const formatType = Number(sticker.format_type);
-  if (!/^\d{15,25}$/.test(id)) return "#";
-  if (formatType === 1 || formatType === 2) return `https://cdn.discordapp.com/stickers/${id}.png`;
-  if (formatType === 4) return `https://cdn.discordapp.com/stickers/${id}.gif`;
-  return "#";
-}
-
-function renderSticker(sticker: Json): string {
-  const url = stickerUrl(sticker);
-  const name = String(sticker.name || "Discord sticker");
-  if (url === "#") return `<div class="attachment"><span class="attachment-icon">🖼️</span><div class="attachment-info"><span class="attachment-name">${escapeHtml(name)}</span><span class="attachment-size">Sticker</span></div></div>`;
-  return `<div class="attachment-media"><a class="attachment-media-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img class="sticker-image" src="${escapeHtml(url)}" alt="${escapeHtml(name)}" loading="lazy" referrerpolicy="no-referrer"></a></div>`;
 }
 
 function renderReactions(reactions: unknown): string {
@@ -1224,9 +1212,6 @@ function renderReactions(reactions: unknown): string {
 function renderMessage(message: Json): string {
   const author = message.author || {};
   const authorId = String(author.id || "");
-  const avatar = author.avatar
-    ? `https://cdn.discordapp.com/avatars/${authorId}/${author.avatar}.png?size=64`
-    : "https://cdn.discordapp.com/embed/avatars/0.png";
   const cachedName = authorId ? state.memberNames.get(authorId) : "";
   const name = String(author.global_name || author.username || cachedName || "Unknown user").trim() || "Unknown user";
   const username = String(author.username || "").trim();
@@ -1239,15 +1224,16 @@ function renderMessage(message: Json): string {
   const body = message.content?.trim()
     ? renderTranscriptBody(String(message.content))
     : attachmentHtml || stickerHtml || embedHtml
-      ? "<span class=\"muted\">Media-only message</span>"
+      ? "<span class=\"muted\">Attachment or embed without text</span>"
       : "<span class=\"muted\">No text content</span>";
   const botBadge = author.bot ? "<span class=\"badge\">BOT</span>" : "";
-  const usernameHtml = username && username !== name ? `<div class=\"username-line\"><span class=\"username\">@${escapeHtml(username)}</span></div>` : "";
+  const usernameHtml = username && username !== name ? `<div class="username-line"><span class="username">@${escapeHtml(username)}</span></div>` : "";
   const replyAuthor = message.referenced_message?.author || {};
   const replyName = String(replyAuthor.global_name || replyAuthor.username || state.memberNames.get(String(replyAuthor.id || "")) || "Unknown user");
-  const reply = message.referenced_message?.author ? `<div class=\"reply\"><span>Replying to</span> <strong>${escapeHtml(replyName)}</strong></div>` : "";
+  const reply = message.referenced_message?.author ? `<div class="reply"><span>Replying to</span> <strong>${escapeHtml(replyName)}</strong></div>` : "";
   const reactions = renderReactions(message.reactions);
-  return `<article class=\"msg${author.bot ? " bot" : ""}\" data-message-id=\"${escapeHtml(String(message.id || ""))}\" data-date=\"${escapeHtml(timestamp.slice(0, 10))}\"><div class=\"message-head\"><img class=\"avatar\" src=\"${escapeHtml(avatar)}\" alt=\"${escapeHtml(name)}\" loading=\"lazy\" referrerpolicy=\"no-referrer\"><div class=\"identity-wrap\"><div class=\"identity\"><span class=\"author\">${escapeHtml(name)}</span>${botBadge}</div>${usernameHtml}</div><div class=\"message-meta\"><time class=\"ts\" datetime=\"${escapeHtml(timestamp)}\">${escapeHtml(formatTranscriptTime(timestamp))}</time></div></div>${reply}<div class=\"body\">${body}</div>${attachmentHtml || stickerHtml ? `<div class=\"attachments\">${attachmentHtml}${stickerHtml}</div>` : ""}${embedHtml ? `<div class=\"embed-list\">${embedHtml}</div>` : ""}${reactions}</article>`;
+  const initial = transcriptInitial(name);
+  return `<article class="msg${author.bot ? " bot" : ""}" data-message-id="${escapeHtml(String(message.id || ""))}" data-date="${escapeHtml(timestamp.slice(0, 10))}"><div class="message-head"><div class="avatar avatar-initial">${initial}</div><div class="identity-wrap"><div class="identity"><span class="author">${escapeHtml(name)}</span>${botBadge}</div>${usernameHtml}</div><div class="message-meta"><time class="ts" datetime="${escapeHtml(timestamp)}">${escapeHtml(formatTranscriptTime(timestamp))}</time></div></div>${reply}<div class="body">${body}</div>${attachmentHtml || stickerHtml ? `<div class="attachments">${attachmentHtml}${stickerHtml}</div>` : ""}${embedHtml ? `<div class="embed-list">${embedHtml}</div>` : ""}${reactions}</article>`;
 }
 
 function transcriptByteLength(html: string): number {
@@ -1296,8 +1282,8 @@ function buildTranscript(ticket: Ticket, messages: string[], reason: string, clo
   const omissionNotice = truncated && omittedMessages > 0 ? `<div class="empty" style="margin-bottom:12px">⚠️ ${omittedMessages} older message(s) were omitted from this HTML copy to keep the transcript within the upload limit. The newest messages were preserved.</div>` : "";
   const duration = formatDuration(closedAt - ticket.createdAt);
   const statusClass = reason.startsWith("automatic") ? "Closed automatically" : "Closed";
-  let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><meta name="description" content="${escapeHtml(BRAND)} support ticket transcript ${escapeHtml(ticket.id)}"><title>${escapeHtml(BRAND)} · Ticket ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><main class="shell"><nav class="topbar"><div class="brand"><span class="brand-mark">🍯</span><span>${escapeHtml(BRAND)}<small>Support transcript</small></span></div><div class="toolbar"><input id="message-search" class="search" type="search" placeholder="Search messages…" aria-label="Search messages"><button id="latest" class="tool-btn" type="button">Latest</button><button id="top" class="tool-btn" type="button">Top</button></div></nav><header class="hero"><div class="hero-row"><div><div class="hero-title"><span class="ticket-icon">🎫</span><div><div class="eyebrow">${escapeHtml(typeLabel)}</div><h1>Ticket ${escapeHtml(ticket.id)}</h1></div></div><p>Complete support record with intake answers, ownership and the full conversation history.</p></div><span class="status"><span class="status-dot"></span>${escapeHtml(statusClass)}</span></div><div class="stats">${transcriptStat("Messages",String(messages.length))}${transcriptStat("Duration",duration)}${transcriptStat("Answers",String(answerCount))}${transcriptStat("Closed",formatTranscriptDate(closedAt))}</div></header>`;
-  html += `<div class="grid"><div><section class="card"><div class="card-heading"><div><div class="eyebrow">Conversation</div><h2>Message timeline</h2><p>Chronological messages, media, embeds, reactions and role context.</p></div><span class="count">${messages.length} messages</span></div><div id="timeline" class="timeline">${omissionNotice}${messages.length ? messages.join("") : "<div class=\"empty\">No messages were captured before the ticket was closed.</div>"}<div id="no-results" class="no-results">No messages match your search.</div></div></section></div><aside><section class="card"><div class="card-heading"><div><div class="eyebrow">Ticket details</div><h2>Context & ownership</h2></div></div><div class="details">${transcriptDetail("Type",typeLabel)}${transcriptDetail("Reason",reason)}${transcriptDetail("Created",formatTranscriptDate(ticket.createdAt))}${transcriptDetail("Closed",formatTranscriptDate(closedAt))}${transcriptDetail("Ticket ID",ticket.id,true)}<div class="detail"><span class="detail-label">Ticket ID actions</span><button class="copy-id" type="button" data-copy="${escapeHtml(ticket.id)}">Copy</button></div></div></section><section class="card"><div class="card-heading"><div><div class="eyebrow">People</div><h2>Ownership</h2></div></div><div class="people">${transcriptPerson("Owner",ownerLabel,ticket.ownerId)}${transcriptPerson("Claimed by",claimed,ticket.claimedBy || "—")}${transcriptPerson("Closed by",closeUser,closedBy || "system")}</div></section><section class="card"><div class="card-heading"><div><div class="eyebrow">Intake</div><h2>Submitted answers</h2></div><span class="count">${answerCount}</span></div>`;
+  let html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><meta name="description" content="${escapeHtml(BRAND)} support ticket transcript ${escapeHtml(ticket.id)}"><title>${escapeHtml(BRAND)} · Ticket ${escapeHtml(ticket.id)}</title>${TRANSCRIPT_CSS}</head><body><main class="shell"><nav class="topbar"><div class="brand"><span class="brand-mark">🍯</span><span>${escapeHtml(BRAND)}<small>Support audit transcript</small></span></div><div class="toolbar"><input id="message-search" class="search" type="search" placeholder="Search messages…" aria-label="Search messages"><button id="latest" class="tool-btn" type="button">Latest</button><button id="top" class="tool-btn" type="button">Top</button></div></nav><header class="hero"><div class="hero-row"><div><div class="hero-title"><span class="ticket-icon">🎫</span><div><div class="eyebrow">${escapeHtml(typeLabel)}</div><h1>Ticket ${escapeHtml(ticket.id)}</h1></div></div><p>Compact support audit with intake answers, ownership and the full conversation history.</p></div><span class="status"><span class="status-dot"></span>${escapeHtml(statusClass)}</span></div><div class="stats">${transcriptStat("Messages",String(messages.length))}${transcriptStat("Duration",duration)}${transcriptStat("Answers",String(answerCount))}${transcriptStat("Closed",formatTranscriptDate(closedAt))}</div></header>`;
+  html += `<div class="grid"><div><section class="card"><div class="card-heading"><div><div class="eyebrow">Conversation</div><h2>Message timeline</h2><p>Chronological messages, stickers, mentions, reactions and attachment records.</p></div><span class="count">${messages.length} messages</span></div><div id="timeline" class="timeline">${omissionNotice}${messages.length ? messages.join("") : "<div class=\"empty\">No messages were captured before the ticket was closed.</div>"}<div id="no-results" class="no-results">No messages match your search.</div></div></section></div><aside><section class="card"><div class="card-heading"><div><div class="eyebrow">Ticket details</div><h2>Context & ownership</h2></div></div><div class="details">${transcriptDetail("Type",typeLabel)}${transcriptDetail("Reason",reason)}${transcriptDetail("Created",formatTranscriptDate(ticket.createdAt))}${transcriptDetail("Closed",formatTranscriptDate(closedAt))}${transcriptDetail("Ticket ID",ticket.id,true)}<div class="detail"><span class="detail-label">Ticket ID actions</span><button class="copy-id" type="button" data-copy="${escapeHtml(ticket.id)}">Copy</button></div></div></section><section class="card"><div class="card-heading"><div><div class="eyebrow">People</div><h2>Ownership</h2></div></div><div class="people">${transcriptPerson("Owner",ownerLabel,ticket.ownerId)}${transcriptPerson("Claimed by",claimed,ticket.claimedBy || "—")}${transcriptPerson("Closed by",closeUser,closedBy || "system")}</div></section><section class="card"><div class="card-heading"><div><div class="eyebrow">Intake</div><h2>Submitted answers</h2></div><span class="count">${answerCount}</span></div>`;
   if (!ticket.answers.length) html += `<div class="empty">No answers were recorded for this ticket.</div>`;
   else {
     html += `<div class="answers">`;
@@ -1305,7 +1291,7 @@ function buildTranscript(ticket: Ticket, messages: string[], reason: string, clo
     for (const [label, value] of ticket.answers) html += `<div class="answer"><div class="answer-index">${index++}</div><div><div class="answer-label">${escapeHtml(label)}</div><div class="answer-value">${escapeHtml(value || "—")}</div></div></div>`;
     html += `</div>`;
   }
-  html += `</section></aside></div><footer class="footer">Generated by <strong>${escapeHtml(BRAND)} Support</strong> · Ticket <span class="mono">${escapeHtml(ticket.id)}</span> · Transcript format v2</footer></main>${TRANSCRIPT_SCRIPT}</body></html>`;
+  html += `</section></aside></div><footer class="footer">Generated by <strong>${escapeHtml(BRAND)} Support</strong> · Ticket <span class="mono">${escapeHtml(ticket.id)}</span> · Transcript format v4 • text and sticker audit record</footer></main>${TRANSCRIPT_SCRIPT}</body></html>`;
   return html;
 }
 
@@ -1320,7 +1306,7 @@ async function disableRatingMessage(interaction: Interaction, ticketId: Snowflak
   }).catch((error) => log(`rating button update failed for ${ticketId}`, error));
 }
 
-async function sendRating(ticket: Ticket, html: string): Promise<void> {
+async function sendRating(ticket: Ticket, html: string, files?: UploadFile[]): Promise<void> {
   if (state.ratings.has(ticket.id) || state.ratingInProgress.has(ticket.id) || state.completedRatings.has(ticket.id)) return;
   const channel = await discordRequest(`/users/@me/channels`, { method: "POST" }, { recipient_id: ticket.ownerId });
   await sendMessage(channel.id, {
@@ -1347,12 +1333,16 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
   state.closing.add(ticket.channelId);
   if (state.tickets.get(ticket.channelId) !== undefined) state.tickets.delete(ticket.channelId);
   try {
-    const messages = await fetchMessages(ticket.channelId, [ticket.ownerId, ticket.claimedBy || "", closedBy || ""]).catch((error) => {
+    const capture = await fetchMessages(ticket.channelId, [ticket.ownerId, ticket.claimedBy || "", closedBy || ""]).catch((error) => {
       log(`message pagination failed in ${ticket.channelId}`, error);
-      return [];
+      return { messages: [], assets: new Map<string, Uint8Array>() };
     });
+    const messages = capture.messages;
     const { html, omitted } = fitTranscriptToUploadBudget(ticket, messages, reason, closedBy);
     if (omitted > 0) log(`transcript ${ticket.channelId} omitted ${omitted} older message(s) to fit the upload budget`);
+    const uploadFiles: UploadFile[] = [
+      { name: `transcript-${ticket.id}.html`, content: html, contentType: "text/html; charset=utf-8" }
+    ];
     await sendMessage(cfg().transcriptChannelId, {
       embeds: [{
         ...embed(`📄 ${BRAND} • Ticket Transcript`, 0x5865f2),
@@ -1367,8 +1357,8 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
           { name: "Duration", value: formatDuration(Date.now() - ticket.createdAt), inline: true }
         ]
       }]
-    }, { name: `transcript-${ticket.id}.html`, content: html }).catch((error) => log(`transcript send failed for ${ticket.id}`, error));
-    await sendRating(ticket, html).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
+    }, uploadFiles).catch((error) => log(`transcript send failed for ${ticket.id}`, error));
+    await sendRating(ticket, html, uploadFiles).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
     await sendMessage(cfg().logChannelId, {
       embeds: [{
         ...embed(reason === "manual" ? `🔴 ${BRAND} • Closed Manually` : `🔴 ${BRAND} • Closed Automatically`, 0xed4245),
@@ -1393,6 +1383,26 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
   }
 }
 
+function closeReasonModal(ticketId: Snowflake): Json {
+  return {
+    custom_id: `ticket_close_reason_${ticketId}`,
+    title: `${BRAND} • Close Ticket`.slice(0, 45),
+    components: [{
+      type: 1,
+      components: [{
+        type: 4,
+        custom_id: "close_reason",
+        style: 2,
+        label: "Reason for closing",
+        placeholder: "Explain why this ticket is being closed…",
+        required: true,
+        min_length: 3,
+        max_length: 500
+      }]
+    }]
+  };
+}
+
 async function handleClose(interaction: Interaction): Promise<void> {
   const ticket = state.tickets.get(interaction.channel_id || "");
   if (!ticket) {
@@ -1403,8 +1413,7 @@ async function handleClose(interaction: Interaction): Promise<void> {
     await ephemeral(interaction, "❌ You no longer have permission to interact with this ticket.");
     return;
   }
-  await defer(interaction);
-  void closeTicket(ticket, "manual", interactionUserId(interaction)).catch((error) => log("manual close failed", error));
+  await interactionCallback(interaction, 9, closeReasonModal(ticket.id));
 }
 
 function feedbackModal(ticketId: Snowflake): Json {
@@ -1493,6 +1502,22 @@ async function handleFeedback(interaction: Interaction, ticketId: Snowflake): Pr
 
 async function handleModalSubmit(interaction: Interaction): Promise<void> {
   const customId = interaction.data?.custom_id || "";
+  if (customId.startsWith("ticket_close_reason_")) {
+    const ticketId = customId.slice("ticket_close_reason_".length);
+    const ticket = state.tickets.get(ticketId);
+    if (!ticket || ticket.channelId !== interaction.channel_id) {
+      await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+      return;
+    }
+    if (!canInteractWithTicket(interaction, ticket)) {
+      await ephemeral(interaction, "❌ You no longer have permission to close this ticket.");
+      return;
+    }
+    const reason = modalInputs(interaction).get("close_reason")?.trim() || "No reason provided";
+    await defer(interaction);
+    void closeTicket(ticket, reason, interactionUserId(interaction)).catch((error) => log("manual close failed", error));
+    return;
+  }
   if (customId.startsWith("rating_feedback_")) {
     const ticketId = customId.slice("rating_feedback_".length);
     await handleFeedback(interaction, ticketId);
