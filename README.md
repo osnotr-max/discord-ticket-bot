@@ -58,7 +58,9 @@ Configure the environment variables in the provider. Never commit a real
 
 `MAX_TRANSCRIPT_PAGES` defaults to 50 and is capped at 50 to keep transcript
 closures bounded on a small server. Lower it if tickets can contain a very
-large history.
+large history. `TRANSCRIPT_PAGE_DELAY_MS` defaults to 250ms to keep pagination
+fast without hammering the Discord API. `DISCORD_REQUEST_TIMEOUT_MS` defaults
+to 15s so a stalled Discord request cannot block the bot indefinitely.
 
 ## Required environment variables
 
