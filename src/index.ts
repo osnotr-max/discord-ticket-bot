@@ -124,6 +124,7 @@ const TYPES: TicketType[] = [
   {
     typeId: "script",
     channelPrefix: "script-",
+    mentionRoleIds: ["1525161655053320385", "1525161656202563674"],
     buttonLabel: "Script Support",
     emoji: "🎫",
     fields: [
@@ -135,6 +136,7 @@ const TYPES: TicketType[] = [
   {
     typeId: "general",
     channelPrefix: "support-",
+    mentionRoleIds: ["1525161655053320385", "1525161656202563674"],
     buttonLabel: "General Support",
     emoji: "🎧",
     fields: [
