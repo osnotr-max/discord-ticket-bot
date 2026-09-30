@@ -147,3 +147,11 @@ Closing a ticket opens a required reason modal. The exact reason is stored in th
 - Token configuration rejects newline-containing values to reduce accidental header injection.
 - Close-request history is capped to a small fixed window.
 - The source remains TypeScript for maintainability; the production artifact is the minimized `dist/honeylua.js`.
+
+## Support Lock
+- `/support-lock duration reason` temporarily disables new support ticket creation.
+- Supported durations: `30m`, `4h`, `2h30m`, `1d` (1 minute minimum, 30 days maximum).
+- The lock is persisted in `support-lock.json` and expires automatically.
+- `/support-unlock` re-enables support immediately.
+- Existing tickets are unaffected.
+- No `/support-status` command is included.
