@@ -94,9 +94,10 @@ application:
   administrators retain access. The `Release Ticket` action restores the
   appropriate role access.
 
-The bot stores a compact metadata marker in each new ticket channel topic and
-hydrates open ticket channels after a restart. Existing channels without that
-marker are recovered from their channel name and member permission overwrites.
+Ticket channel topics are human-readable and show the ticket type and current
+claim status. Open tickets are hydrated after a restart from their channel name
+and permission overwrites, while legacy metadata topics are automatically cleaned
+up when the bot reconnects.
 
 The bot needs the Server Members intent only if another feature outside this
 repository requires it; this implementation does not request it. Enable
@@ -106,7 +107,43 @@ After startup, an administrator can use `/setup_panel` in the configured
 server.
 
 ### Transcript media
-Transcripts now include a complete offline `transcript-<ticket>.tar.gz` bundle. Discord attachments are downloaded while the ticket is being closed and stored locally inside the archive, so images, GIFs, videos and audio do not depend on expiring Discord CDN URLs. The archive contains `index.html` plus a `media/` directory. A standalone HTML copy is also attached when it is small enough.
+
+Transcripts are audit-focused: they preserve text, stickers, mentions, reactions,
+replies and attachment metadata, but they do not download or embed uploaded
+images, videos, audio or files. This keeps memory, disk and transcript size under
+control while preserving the conversation record.
+
+### Ticket management
+
+The bot provides the following slash commands:
+
+- `/setup_panel` — publish the support panel.
+- `/close` — close the current ticket with a required reason.
+- `/close-request` — request ticket closure.
+- `/context` — show bot/runtime status.
+- `/add-user` — give another server member access to the current ticket.
+- `/remove-user` — remove an added member from the current ticket.
+- `/create-ticket` — create an administrator-defined custom ticket with a custom
+  name, description, owner and staff role IDs.
 
 ### Close reason
 Closing a ticket opens a required reason modal. The exact reason is stored in the transcript and close log.
+
+
+## v2.6.1
+- Close requests now keep an audit history in the request message.
+- Close request messages include a Close Ticket action and an integrated Rate Support button.
+- Owners can open the rating flow directly from the ticket.
+- Ratings remain available as a DM fallback when the ticket is closed.
+
+
+## v2.7.0 Security & Performance Hardening
+
+- Production builds are minified with Bun and do not emit source maps.
+- Discord request retries are method-aware to avoid replaying non-idempotent POST operations after network or server failures.
+- 429 responses remain retryable with Discord's retry timing.
+- Runtime member, action-cooldown, and create-cooldown caches are explicitly bounded.
+- Discord IDs are validated as Snowflakes during configuration loading.
+- Token configuration rejects newline-containing values to reduce accidental header injection.
+- Close-request history is capped to a small fixed window.
+- The source remains TypeScript for maintainability; the production artifact is the minimized `dist/honeylua.js`.
