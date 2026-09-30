@@ -21,7 +21,7 @@ const STAFF_REPORT_ROLE_IDS = [
 const USER_REPORT_ROLE_ID = "1525161655053320385";
 const BRAND = "Honeylua";
 const SUPPORT_NAME = "Honeylua Support";
-const BOT_VERSION = "2.8.1";
+const BOT_VERSION = "2.8.2";
 const SUPPORT_LOCK_FILE = "support-lock.json";
 const MAX_MEMBER_CACHE = 2000;
 const MAX_ACTION_COOLDOWN_ENTRIES = 5000;
@@ -1890,7 +1890,9 @@ async function handleCloseRequest(interaction: Interaction): Promise<void> {
 
   await ephemeral(interaction, "✅ Close request sent.");
   await sendMessage(interaction.channel_id!, {
-    content: `<@${userId}>`,
+    // Always notify the ticket customer, not the person who submitted the close request.
+    content: `<@${ticket.ownerId}>`,
+    allowed_mentions: { users: [ticket.ownerId] },
     embeds: [{
       ...embed(`🔔 ${BRAND} • Close Request`, 0xf0b429, "Do you want to close this ticket?"),
       fields: [
