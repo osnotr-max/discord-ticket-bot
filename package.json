@@ -1,6 +1,6 @@
 {
   "name": "honeylua",
-  "version": "2.5.1",
+  "version": "2.5.3",
   "private": true,
   "description": "Low-memory Discord support ticket bot with audit-focused transcripts and admin context tools.",
   "type": "module",
