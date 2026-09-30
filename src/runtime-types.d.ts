@@ -3,6 +3,8 @@ declare const Bun: {
   sleep(ms: number): Promise<void>;
   Archive: any;
   version: string;
+  write(path: string, data: string | Uint8Array): Promise<number>;
+  file(path: string): { text(): Promise<string> };
 };
 
 declare const process: {

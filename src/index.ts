@@ -21,7 +21,8 @@ const STAFF_REPORT_ROLE_IDS = [
 const USER_REPORT_ROLE_ID = "1525161655053320385";
 const BRAND = "Honeylua";
 const SUPPORT_NAME = "Honeylua Support";
-const BOT_VERSION = "2.7.0";
+const BOT_VERSION = "2.8.1";
+const SUPPORT_LOCK_FILE = "support-lock.json";
 const MAX_MEMBER_CACHE = 2000;
 const MAX_ACTION_COOLDOWN_ENTRIES = 5000;
 const MAX_CREATE_COOLDOWN_ENTRIES = 2000;
@@ -78,6 +79,8 @@ interface Ticket {
   customAccessRoleIds?: Snowflake[];
   customMentionRoleIds?: Snowflake[];
   closeRequestHistory?: { userId: Snowflake; reason: string; createdAt: number }[];
+  closeRequestReason?: string;
+  closeRequestUserId?: Snowflake;
 }
 
 interface RatingPending {
@@ -220,6 +223,8 @@ const state = {
   creating: new Set<string>(),
   creatingUsers: new Set<Snowflake>(),
   pendingCreations: 0,
+  supportLock: null as { lockedUntil: number; reason: string; createdBy: Snowflake } | null,
+  supportLockTimer: null as ReturnType<typeof setTimeout> | null,
   guildRoleIds: new Set<Snowflake>(),
   guildRoleNames: new Map<Snowflake, string>(),
   guildRolePermissions: new Map<Snowflake, bigint>(),
@@ -258,6 +263,83 @@ function boolEnv(name: string, fallback: boolean): boolean {
   if (["1", "true", "yes", "sim"].includes(raw)) return true;
   if (["0", "false", "no", "nao", "não"].includes(raw)) return false;
   return fallback;
+}
+
+function isSupportLocked(): boolean {
+  const lock = state.supportLock;
+  if (!lock) return false;
+  if (Date.now() < lock.lockedUntil) return true;
+  clearSupportLockMemory();
+  return false;
+}
+
+function clearSupportLockMemory(): void {
+  state.supportLock = null;
+  if (state.supportLockTimer) clearTimeout(state.supportLockTimer);
+  state.supportLockTimer = null;
+}
+
+async function persistSupportLock(): Promise<void> {
+  try {
+    if (!state.supportLock) {
+      await Bun.write(SUPPORT_LOCK_FILE, JSON.stringify({ lockedUntil: 0 }));
+      return;
+    }
+    await Bun.write(SUPPORT_LOCK_FILE, JSON.stringify(state.supportLock));
+  } catch (error) {
+    log("support lock persistence failed", error);
+  }
+}
+
+async function loadSupportLock(): Promise<void> {
+  try {
+    const raw = await Bun.file(SUPPORT_LOCK_FILE).text();
+    const parsed = JSON.parse(raw);
+    const lockedUntil = Number(parsed?.lockedUntil);
+    const reason = typeof parsed?.reason === "string" ? truncate(parsed.reason.trim(), 500) : "Support temporarily unavailable.";
+    const createdBy = typeof parsed?.createdBy === "string" && /^\d+$/.test(parsed.createdBy) ? parsed.createdBy : "0";
+    if (!Number.isSafeInteger(lockedUntil) || lockedUntil <= Date.now()) {
+      clearSupportLockMemory();
+      if (lockedUntil) await persistSupportLock();
+      return;
+    }
+    state.supportLock = { lockedUntil, reason, createdBy };
+    scheduleSupportUnlock();
+    log(`support locked until ${new Date(lockedUntil).toISOString()}`);
+  } catch {
+    // Missing/invalid state is treated as unlocked; the feature remains lightweight.
+  }
+}
+
+function scheduleSupportUnlock(): void {
+  if (state.supportLockTimer) clearTimeout(state.supportLockTimer);
+  if (!state.supportLock) return;
+  const delay = Math.max(1, state.supportLock.lockedUntil - Date.now());
+  state.supportLockTimer = setTimeout(() => {
+    clearSupportLockMemory();
+    void persistSupportLock();
+    log("support lock expired automatically");
+  }, Math.min(delay, 2_147_483_647));
+}
+
+function parseDuration(raw: string): number | null {
+  const value = raw.trim().toLowerCase().replace(/\s+/g, "");
+  const match = value.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
+  if (!match || !match.slice(1).some(Boolean)) return null;
+  const days = Number(match[1] || 0);
+  const hours = Number(match[2] || 0);
+  const minutes = Number(match[3] || 0);
+  const seconds = Number(match[4] || 0);
+  const ms = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+  if (!Number.isSafeInteger(ms) || ms < 60_000 || ms > 30 * 24 * 60 * 60 * 1000) return null;
+  return ms;
+}
+
+function supportLockMessage(): string {
+  const lock = state.supportLock;
+  if (!lock || !isSupportLocked()) return "";
+  const unix = Math.floor(lock.lockedUntil / 1000);
+  return `🔒 **Support Temporarily Unavailable**\n\nSupport ticket creation is currently disabled.\n\n**Reason:** ${lock.reason}\n**Reopens:** <t:${unix}:F> (<t:${unix}:R>)`;
 }
 
 function loadConfig(): Config {
@@ -827,6 +909,7 @@ function actionKey(interaction: Interaction): string | undefined {
     if (customId === "ticket_claim") return "ticket_claim";
     if (customId === "ticket_unclaim") return "ticket_unclaim";
     if (customId === "ticket_close") return "ticket_close";
+    if (customId.startsWith("close_request_close_")) return "close_request_close";
     if (customId.startsWith("rate_")) return "rating";
     if (customId.startsWith("rating_prompt_")) return "rating_prompt";
   }
@@ -856,6 +939,10 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
   const owner = interactionUser(interaction);
   const ownerId = owner.id;
   const now = Date.now();
+  if (isSupportLocked()) {
+    await followup(interaction, supportLockMessage());
+    return;
+  }
   if (state.hydratingTickets) {
     await followup(interaction, "⏳ Honeylua is restoring open tickets. Please submit this form again in a moment.");
     return;
@@ -1431,9 +1518,9 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
         fields: [
           { name: "Ticket", value: ticket.id, inline: true },
           { name: "Type", value: ticket.typeId, inline: true },
-          { name: "Owner", value: `${ticket.ownerName} (${ticket.ownerId})`, inline: true },
-          { name: "Claimed by", value: ticket.claimedBy || "—", inline: true },
-          { name: "Closed by", value: closedBy || "system", inline: true },
+          { name: "Opened by", value: `<@${ticket.ownerId}>`, inline: true },
+          { name: "Claimed by", value: ticket.claimedBy ? `<@${ticket.claimedBy}>` : "—", inline: true },
+          { name: "Closed by", value: closedBy ? `<@${closedBy}>` : "system", inline: true },
           { name: "Reason", value: reason, inline: true },
           { name: "Messages", value: String(messages.length), inline: true },
           { name: "Duration", value: formatDuration(Date.now() - ticket.createdAt), inline: true }
@@ -1794,45 +1881,42 @@ async function handleCloseRequest(interaction: Interaction): Promise<void> {
     return;
   }
   const reason = truncate(interactionOption(interaction, "reason"), 500) || "The ticket owner requested closure.";
-  await ephemeral(interaction, "✅ Your close request was sent to the support team.");
-  const message = await sendMessage(interaction.channel_id!, {
-    content: ticketCreateMention(findType(ticket.typeId) || TYPES[0], ticket),
-    embeds: [{
-      ...embed(`🔔 ${BRAND} • Close Request`, 0xf0b429, `${displayName(interaction.member, interaction.user)} requested that this ticket be closed.\n\n**Reason:** ${escapeHtml(reason)}`),
-      fields: [
-        { name: "Ticket", value: ticket.id, inline: true },
-        { name: "Status", value: ticket.claimedBy ? `Claimed by <@${ticket.claimedBy}>` : "Waiting for staff", inline: true },
-        { name: "Requested by", value: `<@${userId}>`, inline: true },
-        { name: "Close History", value: "Recording request…", inline: false }
-      ]
-    }],
-    components: [row([button("ticket_close", "🔴 Close Ticket", 4), button(`rating_prompt_${ticket.id}`, "⭐ Rate Support", 2)])]
-  }).catch((error) => {
-    log("close request message failed", error);
-    return null;
-  });
-  if (message?.id) {
-    ticket.closeRequestHistory = [
-      ...(ticket.closeRequestHistory || []),
-      { userId, reason, createdAt: Date.now() }
-    ].slice(-MAX_CLOSE_HISTORY);
+  ticket.closeRequestReason = reason;
+  ticket.closeRequestUserId = userId;
+  ticket.closeRequestHistory = [
+    ...(ticket.closeRequestHistory || []),
+    { userId, reason, createdAt: Date.now() }
+  ].slice(-MAX_CLOSE_HISTORY);
 
-    await discordRequest(`/channels/${interaction.channel_id}/messages/${message.id}`, { method: "PATCH" }, {
-      embeds: [{
-        ...embed(`🔔 ${BRAND} • Close Request`, 0xf0b429, `${displayName(interaction.member, interaction.user)} requested that this ticket be closed.\n\n**Reason:** ${escapeHtml(reason)}`),
-        fields: [
-          { name: "Ticket", value: ticket.id, inline: true },
-          { name: "Status", value: ticket.claimedBy ? `Claimed by <@${ticket.claimedBy}>` : "Waiting for staff", inline: true },
-          { name: "Requested by", value: `<@${userId}>`, inline: true },
-          { name: "Close History", value: truncate(closeHistoryText(ticket), 1024), inline: false }
-        ],
-        footer: { text: `${BRAND} • Close requests are kept for audit history` }
-      }],
-      components: [
-        row([button("ticket_close", "🔴 Close Ticket", 4), button(`rating_prompt_${ticket.id}`, "⭐ Rate Support", 2)])
-      ]
-    }).catch((error) => log("close request history update failed", error));
+  await ephemeral(interaction, "✅ Close request sent.");
+  await sendMessage(interaction.channel_id!, {
+    content: `<@${userId}>`,
+    embeds: [{
+      ...embed(`🔔 ${BRAND} • Close Request`, 0xf0b429, "Do you want to close this ticket?"),
+      fields: [
+        { name: "Reason", value: escapeHtml(reason), inline: false },
+        { name: "Requested by", value: `<@${userId}>`, inline: true },
+        { name: "Close History", value: truncate(closeHistoryText(ticket), 1024), inline: false }
+      ],
+      footer: { text: `${BRAND} • Close request` }
+    }],
+    components: [row([button(`close_request_close_${ticket.id}`, "🔴 Close Ticket", 4)])]
+  }).catch((error) => log("close request message failed", error));
+}
+
+async function handleCloseRequestClose(interaction: Interaction, ticketId: Snowflake): Promise<void> {
+  const ticket = state.tickets.get(ticketId);
+  if (!ticket || ticket.channelId !== interaction.channel_id) {
+    await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
+    return;
   }
+  if (!canInteractWithTicket(interaction, ticket)) {
+    await ephemeral(interaction, "❌ You no longer have permission to close this ticket.");
+    return;
+  }
+  const reason = truncate(ticket.closeRequestReason || ticket.closeRequestHistory?.at(-1)?.reason || "The ticket owner requested closure.", 500);
+  await defer(interaction);
+  void closeTicket(ticket, reason, interactionUserId(interaction)).catch((error) => log("close request close failed", error));
 }
 
 function formatUptime(ms: number): string {
@@ -1897,12 +1981,15 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     else if (interaction.type === 2 && interaction.data?.name === "add-user") await handleAddUser(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "remove-user") await handleRemoveUser(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "create-ticket") await handleCreateCustomTicket(interaction);
+    else if (interaction.type === 2 && interaction.data?.name === "support-lock") await handleSupportLock(interaction);
+    else if (interaction.type === 2 && interaction.data?.name === "support-unlock") await handleSupportUnlock(interaction);
     else if (interaction.type === 3 && customId.startsWith("ticket_open_")) {
       const type = findType(customId.replace("ticket_open_", ""));
       if (type) await interactionCallback(interaction, 9, modal(type));
     } else if (interaction.type === 3 && customId === "ticket_claim") await handleClaim(interaction);
     else if (interaction.type === 3 && customId === "ticket_unclaim") await handleUnclaim(interaction);
     else if (interaction.type === 3 && customId === "ticket_close") await handleClose(interaction);
+    else if (interaction.type === 3 && customId.startsWith("close_request_close_")) await handleCloseRequestClose(interaction, customId.slice("close_request_close_".length));
     else if (interaction.type === 3 && customId.startsWith("rating_prompt_")) {
       await handleRatingPrompt(interaction, customId.slice("rating_prompt_".length));
     } else if (interaction.type === 3 && customId.startsWith("rate_")) {
@@ -2088,6 +2175,44 @@ function slashOption(name: string, description: string, type = 3, required = fal
   return { type, name, description, required };
 }
 
+async function handleSupportLock(interaction: Interaction): Promise<void> {
+  if (!isAdministrator(interaction)) {
+    await ephemeral(interaction, "❌ Only administrators can lock support ticket creation.");
+    return;
+  }
+  const durationRaw = String(interactionOption(interaction, "duration") || "");
+  const reason = truncate(String(interactionOption(interaction, "reason") || "").trim(), 500);
+  const duration = parseDuration(durationRaw);
+  if (!duration) {
+    await ephemeral(interaction, "❌ Invalid duration. Use formats such as `30m`, `4h`, `2h30m`, or `1d`. Maximum: 30 days.");
+    return;
+  }
+  if (reason.length < 3) {
+    await ephemeral(interaction, "❌ Please provide a reason with at least 3 characters.");
+    return;
+  }
+  const lockedUntil = Date.now() + duration;
+  state.supportLock = { lockedUntil, reason, createdBy: interactionUserId(interaction) };
+  scheduleSupportUnlock();
+  await persistSupportLock();
+  const unix = Math.floor(lockedUntil / 1000);
+  await ephemeral(interaction, `🔒 Support ticket creation is now disabled.\n\n**Reason:** ${reason}\n**Reopens:** <t:${unix}:F> (<t:${unix}:R>)`);
+}
+
+async function handleSupportUnlock(interaction: Interaction): Promise<void> {
+  if (!isAdministrator(interaction)) {
+    await ephemeral(interaction, "❌ Only administrators can unlock support ticket creation.");
+    return;
+  }
+  if (!state.supportLock) {
+    await ephemeral(interaction, "ℹ️ Support ticket creation is already enabled.");
+    return;
+  }
+  clearSupportLockMemory();
+  await persistSupportLock();
+  await ephemeral(interaction, "🟢 Support ticket creation has been enabled again.");
+}
+
 async function registerCommand(): Promise<void> {
   // Guild PUT replaces the complete command set, so stale guild commands are removed automatically.
   const commands = [
@@ -2128,6 +2253,18 @@ async function registerCommand(): Promise<void> {
         slashOption("description", "Optional description shown in the ticket", 3, false),
         slashOption("roles", "Optional staff role IDs with access", 3, false)
       ]
+    },
+    {
+      name: "support-lock",
+      description: "Temporarily disable new support ticket creation",
+      options: [
+        slashOption("duration", "Duration such as 30m, 4h, 2h30m, or 1d", 3, true),
+        slashOption("reason", "Why support ticket creation is being disabled", 3, true)
+      ]
+    },
+    {
+      name: "support-unlock",
+      description: "Enable new support ticket creation immediately"
     }
   ];
   await discordRequest(`/applications/${state.applicationId}/guilds/${cfg().guildId}/commands`, { method: "PUT" }, commands);
@@ -2283,6 +2420,7 @@ async function main(): Promise<void> {
     console.error(error);
     process.exit(1);
   }
+  await loadSupportLock();
   setInterval(() => void maintenance().catch((error) => log("maintenance failed", error)), 60000);
   connectGateway();
 }
