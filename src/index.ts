@@ -21,8 +21,13 @@ const STAFF_REPORT_ROLE_IDS = [
 const USER_REPORT_ROLE_ID = "1525161655053320385";
 const BRAND = "Honeylua";
 const SUPPORT_NAME = "Honeylua Support";
-const BOT_VERSION = "2.8.2";
-const SUPPORT_LOCK_FILE = "support-lock.json";
+const BOT_VERSION = "2.9.1";
+const STAFF_RANKING_FILE = "staff-ranking.json";
+const MAX_STAFF_RANKING_ENTRIES = 5000;
+const STAFF_RANKING_MONTH_LABELS = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+] as const;
 const MAX_MEMBER_CACHE = 2000;
 const MAX_ACTION_COOLDOWN_ENTRIES = 5000;
 const MAX_CREATE_COOLDOWN_ENTRIES = 2000;
@@ -93,6 +98,7 @@ interface RatingPending {
 
 interface RatingInProgress extends RatingPending {
   stars: number;
+  closeAfterRating?: boolean;
 }
 
 interface Interaction {
@@ -223,8 +229,10 @@ const state = {
   creating: new Set<string>(),
   creatingUsers: new Set<Snowflake>(),
   pendingCreations: 0,
-  supportLock: null as { lockedUntil: number; reason: string; createdBy: Snowflake } | null,
-  supportLockTimer: null as ReturnType<typeof setTimeout> | null,
+  staffResolutions: new Map<Snowflake, number>(),
+  staffRankingLoaded: false,
+  staffRankingLoad: null as Promise<void> | null,
+  staffRankingMonth: "",
   guildRoleIds: new Set<Snowflake>(),
   guildRoleNames: new Map<Snowflake, string>(),
   guildRolePermissions: new Map<Snowflake, bigint>(),
@@ -265,81 +273,110 @@ function boolEnv(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
-function isSupportLocked(): boolean {
-  const lock = state.supportLock;
-  if (!lock) return false;
-  if (Date.now() < lock.lockedUntil) return true;
-  clearSupportLockMemory();
-  return false;
+function currentStaffRankingMonth(): string {
+  const now = new Date();
+  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-function clearSupportLockMemory(): void {
-  state.supportLock = null;
-  if (state.supportLockTimer) clearTimeout(state.supportLockTimer);
-  state.supportLockTimer = null;
+function staffRankingMonthLabel(month: string): string {
+  const [year, rawMonth] = month.split("-").map(Number);
+  const monthName = STAFF_RANKING_MONTH_LABELS[Math.max(0, Math.min(11, (rawMonth || 1) - 1))];
+  return `${monthName} ${year}`;
 }
 
-async function persistSupportLock(): Promise<void> {
+async function persistStaffRanking(): Promise<void> {
   try {
-    if (!state.supportLock) {
-      await Bun.write(SUPPORT_LOCK_FILE, JSON.stringify({ lockedUntil: 0 }));
-      return;
-    }
-    await Bun.write(SUPPORT_LOCK_FILE, JSON.stringify(state.supportLock));
+    const entries = [...state.staffResolutions.entries()]
+      .filter(([, count]) => Number.isSafeInteger(count) && count > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, MAX_STAFF_RANKING_ENTRIES)
+      .map(([id, count]) => ({ id, count }));
+    // Only the current month is persisted. Old monthly counters are never retained.
+    await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month: state.staffRankingMonth, entries }));
   } catch (error) {
-    log("support lock persistence failed", error);
+    log("staff ranking persistence failed", error);
   }
 }
 
-async function loadSupportLock(): Promise<void> {
-  try {
-    const raw = await Bun.file(SUPPORT_LOCK_FILE).text();
-    const parsed = JSON.parse(raw);
-    const lockedUntil = Number(parsed?.lockedUntil);
-    const reason = typeof parsed?.reason === "string" ? truncate(parsed.reason.trim(), 500) : "Support temporarily unavailable.";
-    const createdBy = typeof parsed?.createdBy === "string" && /^\d+$/.test(parsed.createdBy) ? parsed.createdBy : "0";
-    if (!Number.isSafeInteger(lockedUntil) || lockedUntil <= Date.now()) {
-      clearSupportLockMemory();
-      if (lockedUntil) await persistSupportLock();
-      return;
+async function loadStaffRanking(): Promise<void> {
+  if (state.staffRankingLoaded) return;
+  if (state.staffRankingLoad) return state.staffRankingLoad;
+  const load = (async () => {
+    const month = currentStaffRankingMonth();
+    state.staffRankingMonth = month;
+    state.staffResolutions.clear();
+    try {
+      const raw = await Bun.file(STAFF_RANKING_FILE).text();
+      const parsed = JSON.parse(raw);
+      const storedMonth = typeof parsed?.month === "string" ? parsed.month : "";
+      const entries = Array.isArray(parsed?.entries)
+        ? parsed.entries
+        : Array.isArray(parsed)
+          ? parsed
+          : Object.entries(parsed || {}).map(([id, count]) => ({ id, count }));
+
+      // If the saved counter belongs to an older month, discard it immediately.
+      if (storedMonth === month || (!storedMonth && entries.length === 0)) {
+        for (const entry of entries) {
+          const id = String(entry?.id || "");
+          const count = Number(entry?.count || 0);
+          if (/^\d{15,25}$/.test(id) && Number.isSafeInteger(count) && count > 0) {
+            state.staffResolutions.set(id, count);
+          }
+        }
+      } else if (storedMonth && storedMonth !== month) {
+        await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month, entries: [] }));
+      }
+    } catch {
+      // Missing or invalid ranking state starts cleanly.
+    } finally {
+      state.staffRankingLoaded = true;
     }
-    state.supportLock = { lockedUntil, reason, createdBy };
-    scheduleSupportUnlock();
-    log(`support locked until ${new Date(lockedUntil).toISOString()}`);
-  } catch {
-    // Missing/invalid state is treated as unlocked; the feature remains lightweight.
+  })();
+  state.staffRankingLoad = load;
+  try { await load; } finally { if (state.staffRankingLoad === load) state.staffRankingLoad = null; }
+}
+
+async function ensureCurrentStaffRankingMonth(): Promise<void> {
+  if (!state.staffRankingLoaded) await loadStaffRanking();
+  const month = currentStaffRankingMonth();
+  if (state.staffRankingMonth === month) return;
+
+  // Month changed: remove the previous month's counters from RAM and disk.
+  state.staffResolutions.clear();
+  state.staffRankingMonth = month;
+  await persistStaffRanking();
+}
+
+async function isStaffForTicket(ticket: Ticket, userId: Snowflake): Promise<boolean> {
+  if (!userId || userId === ticket.ownerId) return false;
+  const type = findType(ticket.typeId);
+  const allowedRoles = ticketAccessRoleIds(type || TYPES[0], ticket);
+  let roles = state.memberRoles.get(userId);
+  if (!roles) {
+    const member = await getGuildMember(userId);
+    if (!member) return false;
+    roles = Array.isArray(member.roles) ? member.roles.map(String) : [];
+    cacheTranscriptMember(userId, displayName(member, member.user), roles);
   }
+  return hasAnyRole(roles, allowedRoles);
 }
 
-function scheduleSupportUnlock(): void {
-  if (state.supportLockTimer) clearTimeout(state.supportLockTimer);
-  if (!state.supportLock) return;
-  const delay = Math.max(1, state.supportLock.lockedUntil - Date.now());
-  state.supportLockTimer = setTimeout(() => {
-    clearSupportLockMemory();
-    void persistSupportLock();
-    log("support lock expired automatically");
-  }, Math.min(delay, 2_147_483_647));
+async function recordStaffResolution(ticket: Ticket, closedBy?: Snowflake): Promise<void> {
+  if (!closedBy || !(await isStaffForTicket(ticket, closedBy))) return;
+  await ensureCurrentStaffRankingMonth();
+  if (!state.staffResolutions.has(closedBy) && state.staffResolutions.size >= MAX_STAFF_RANKING_ENTRIES) {
+    const lowest = [...state.staffResolutions.entries()].sort((a, b) => a[1] - b[1])[0]?.[0];
+    if (lowest) state.staffResolutions.delete(lowest);
+  }
+  state.staffResolutions.set(closedBy, (state.staffResolutions.get(closedBy) || 0) + 1);
+  void persistStaffRanking();
 }
 
-function parseDuration(raw: string): number | null {
-  const value = raw.trim().toLowerCase().replace(/\s+/g, "");
-  const match = value.match(/^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/);
-  if (!match || !match.slice(1).some(Boolean)) return null;
-  const days = Number(match[1] || 0);
-  const hours = Number(match[2] || 0);
-  const minutes = Number(match[3] || 0);
-  const seconds = Number(match[4] || 0);
-  const ms = (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
-  if (!Number.isSafeInteger(ms) || ms < 60_000 || ms > 30 * 24 * 60 * 60 * 1000) return null;
-  return ms;
-}
-
-function supportLockMessage(): string {
-  const lock = state.supportLock;
-  if (!lock || !isSupportLocked()) return "";
-  const unix = Math.floor(lock.lockedUntil / 1000);
-  return `🔒 **Support Temporarily Unavailable**\n\nSupport ticket creation is currently disabled.\n\n**Reason:** ${lock.reason}\n**Reopens:** <t:${unix}:F> (<t:${unix}:R>)`;
+function formatStaffRanking(): string {
+  const ranked = [...state.staffResolutions.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+  if (!ranked.length) return "No staff resolutions have been recorded yet.";
+  return ranked.map(([id, count], index) => `${index + 1}. <@${id}> — **${count}** ticket${count === 1 ? "" : "s"} resolved`).join("\n");
 }
 
 function loadConfig(): Config {
@@ -909,7 +946,8 @@ function actionKey(interaction: Interaction): string | undefined {
     if (customId === "ticket_claim") return "ticket_claim";
     if (customId === "ticket_unclaim") return "ticket_unclaim";
     if (customId === "ticket_close") return "ticket_close";
-    if (customId.startsWith("close_request_close_")) return "close_request_close";
+    if (customId.startsWith("close_request_accept_")) return "close_request_accept";
+    if (customId.startsWith("close_request_reject_")) return "close_request_reject";
     if (customId.startsWith("rate_")) return "rating";
     if (customId.startsWith("rating_prompt_")) return "rating_prompt";
   }
@@ -939,10 +977,6 @@ async function createTicket(interaction: Interaction, type: TicketType, answers:
   const owner = interactionUser(interaction);
   const ownerId = owner.id;
   const now = Date.now();
-  if (isSupportLocked()) {
-    await followup(interaction, supportLockMessage());
-    return;
-  }
   if (state.hydratingTickets) {
     await followup(interaction, "⏳ Honeylua is restoring open tickets. Please submit this form again in a moment.");
     return;
@@ -1498,7 +1532,7 @@ async function sendRating(ticket: Ticket): Promise<void> {
   });
 }
 
-async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake): Promise<void> {
+async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake, sendRatingPrompt = true): Promise<void> {
   if (state.closing.has(ticket.channelId)) return;
   state.closing.add(ticket.channelId);
   try {
@@ -1507,6 +1541,7 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
       return { messages: [] };
     });
     const messages = capture.messages;
+    await recordStaffResolution(ticket, closedBy);
     const { html, omitted } = fitTranscriptToUploadBudget(ticket, messages, reason, closedBy);
     if (omitted > 0) log(`transcript ${ticket.channelId} omitted ${omitted} older message(s) to fit the upload budget`);
     const uploadFiles: UploadFile[] = [
@@ -1527,7 +1562,9 @@ async function closeTicket(ticket: Ticket, reason: string, closedBy?: Snowflake)
         ]
       }]
     }, uploadFiles).catch((error) => log(`transcript send failed for ${ticket.id}`, error));
-    await sendRating(ticket).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
+    if (sendRatingPrompt) {
+      await sendRating(ticket).catch((error) => log(`rating DM failed for ${ticket.id}`, error));
+    }
     await sendMessage(cfg().logChannelId, {
       embeds: [{
         ...embed(reason === "manual" ? `🔴 ${BRAND} • Closed Manually` : `🔴 ${BRAND} • Closed Automatically`, 0xed4245),
@@ -1676,7 +1713,7 @@ async function handleRatingClick(interaction: Interaction, stars: number, ticket
   }
   state.ratings.delete(ticketId);
   state.completedRatings.set(ticketId, Date.now());
-  state.ratingInProgress.set(ticketId, { ...pending, stars, createdAt: Date.now() });
+  state.ratingInProgress.set(ticketId, { ...pending, stars, createdAt: Date.now(), closeAfterRating: true });
   void sendMessage(cfg().logChannelId, { embeds: [ratingLog(userId, stars, pending)] }).catch((error) => log("rating log failed", error));
   void disableRatingMessage(interaction, ticketId);
   await interactionCallback(interaction, 9, feedbackModal(ticketId));
@@ -1699,6 +1736,13 @@ async function handleFeedback(interaction: Interaction, ticketId: Snowflake): Pr
   await ephemeral(interaction, feedback
     ? `⭐ Thank you! Your ${BRAND} rating and feedback were recorded.`
     : `⭐ Thank you! Your ${BRAND} rating was recorded.`);
+  if (progress.closeAfterRating) {
+    const ticket = state.tickets.get(ticketId);
+    if (ticket) {
+      const reason = truncate(ticket.closeRequestReason || ticket.closeRequestHistory?.at(-1)?.reason || "The ticket owner accepted the close request.", 500);
+      void closeTicket(ticket, reason, userId, false).catch((error) => log(`close request final close failed for ${ticketId}`, error));
+    }
+  }
 }
 
 async function handleModalSubmit(interaction: Interaction): Promise<void> {
@@ -1902,23 +1946,70 @@ async function handleCloseRequest(interaction: Interaction): Promise<void> {
       ],
       footer: { text: `${BRAND} • Close request` }
     }],
-    components: [row([button(`close_request_close_${ticket.id}`, "🔴 Close Ticket", 4)])]
+    components: [row([
+      button(`close_request_accept_${ticket.id}`, "✅ Accept", 3),
+      button(`close_request_reject_${ticket.id}`, "❌ Reject", 4)
+    ])]
   }).catch((error) => log("close request message failed", error));
 }
 
-async function handleCloseRequestClose(interaction: Interaction, ticketId: Snowflake): Promise<void> {
+function closeRequestDecisionButtons(ticketId: Snowflake, disabled = false): Json {
+  return row([
+    button(`close_request_accept_${ticketId}`, "✅ Accept", 3, disabled),
+    button(`close_request_reject_${ticketId}`, "❌ Reject", 4, disabled)
+  ]);
+}
+
+async function handleCloseRequestDecision(interaction: Interaction, ticketId: Snowflake, accept: boolean): Promise<void> {
   const ticket = state.tickets.get(ticketId);
+  const userId = interactionUserId(interaction);
   if (!ticket || ticket.channelId !== interaction.channel_id) {
     await ephemeral(interaction, `❌ ${BRAND} ticket not found or already closed.`);
     return;
   }
-  if (!canInteractWithTicket(interaction, ticket)) {
-    await ephemeral(interaction, "❌ You no longer have permission to close this ticket.");
+  if (userId !== ticket.ownerId) {
+    await ephemeral(interaction, "❌ Only the ticket owner can accept or reject this close request.");
     return;
   }
   const reason = truncate(ticket.closeRequestReason || ticket.closeRequestHistory?.at(-1)?.reason || "The ticket owner requested closure.", 500);
-  await defer(interaction);
-  void closeTicket(ticket, reason, interactionUserId(interaction)).catch((error) => log("close request close failed", error));
+
+  void (async () => {
+    if (interaction.channel_id && interaction.message?.id) {
+      await discordRequest(`/channels/${interaction.channel_id}/messages/${interaction.message.id}`, { method: "PATCH" }, {
+        components: [closeRequestDecisionButtons(ticket.id, true)]
+      }).catch((error) => log("close request button update failed", error));
+    }
+  })();
+
+  if (!accept) {
+    // A rejected request is no longer actionable, so remove the request message
+    // instead of leaving a stale close prompt in the ticket.
+    if (interaction.channel_id && interaction.message?.id) {
+      await discordRequest(`/channels/${interaction.channel_id}/messages/${interaction.message.id}`, { method: "DELETE" }).catch((error) =>
+        log("close request message deletion failed", error)
+      );
+    }
+    await ephemeral(interaction, "❌ The close request was rejected. The ticket will remain open.");
+    return;
+  }
+
+  if (state.ratingInProgress.has(ticket.id) || state.completedRatings.has(ticket.id)) {
+    await ephemeral(interaction, "⚠️ This ticket is already in the rating process.");
+    return;
+  }
+  state.ratings.set(ticket.id, {
+    ticketId: ticket.id,
+    ownerId: ticket.ownerId,
+    channelId: ticket.channelId,
+    claimedBy: ticket.claimedBy,
+    createdAt: Date.now()
+  });
+  ticket.closeRequestReason = reason;
+  await interactionCallback(interaction, 4, {
+    flags: 64,
+    content: `⭐ **Before closing your ticket**\n\nPlease rate the support you received. Your rating will be recorded and the ticket will then be closed automatically.\n\n**Close reason:** ${escapeHtml(reason)}`,
+    components: [ratingButtons(ticket.id)]
+  });
 }
 
 function formatUptime(ms: number): string {
@@ -1936,7 +2027,7 @@ async function handleContext(interaction: Interaction): Promise<void> {
   const uptime = formatUptime(Date.now() - BOT_STARTED_AT);
   const gatewayConnected = state.gateway?.readyState === 1;
   const botId = state.applicationId || "Unknown";
-  const commandCount = 7;
+  const commandCount = 8;
   const embedData = {
     ...embed(`🍯 ${BRAND} • Bot Context`, 0x5865f2, "Useful bot, server and service information."),
     fields: [
@@ -1980,18 +2071,18 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
     else if (interaction.type === 2 && interaction.data?.name === "close") await handleCloseCommand(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "close-request") await handleCloseRequest(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "context") await handleContext(interaction);
+    else if (interaction.type === 2 && interaction.data?.name === "staff-ranking") await handleStaffRanking(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "add-user") await handleAddUser(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "remove-user") await handleRemoveUser(interaction);
     else if (interaction.type === 2 && interaction.data?.name === "create-ticket") await handleCreateCustomTicket(interaction);
-    else if (interaction.type === 2 && interaction.data?.name === "support-lock") await handleSupportLock(interaction);
-    else if (interaction.type === 2 && interaction.data?.name === "support-unlock") await handleSupportUnlock(interaction);
     else if (interaction.type === 3 && customId.startsWith("ticket_open_")) {
       const type = findType(customId.replace("ticket_open_", ""));
       if (type) await interactionCallback(interaction, 9, modal(type));
     } else if (interaction.type === 3 && customId === "ticket_claim") await handleClaim(interaction);
     else if (interaction.type === 3 && customId === "ticket_unclaim") await handleUnclaim(interaction);
     else if (interaction.type === 3 && customId === "ticket_close") await handleClose(interaction);
-    else if (interaction.type === 3 && customId.startsWith("close_request_close_")) await handleCloseRequestClose(interaction, customId.slice("close_request_close_".length));
+    else if (interaction.type === 3 && customId.startsWith("close_request_accept_")) await handleCloseRequestDecision(interaction, customId.slice("close_request_accept_".length), true);
+    else if (interaction.type === 3 && customId.startsWith("close_request_reject_")) await handleCloseRequestDecision(interaction, customId.slice("close_request_reject_".length), false);
     else if (interaction.type === 3 && customId.startsWith("rating_prompt_")) {
       await handleRatingPrompt(interaction, customId.slice("rating_prompt_".length));
     } else if (interaction.type === 3 && customId.startsWith("rate_")) {
@@ -2177,42 +2268,14 @@ function slashOption(name: string, description: string, type = 3, required = fal
   return { type, name, description, required };
 }
 
-async function handleSupportLock(interaction: Interaction): Promise<void> {
-  if (!isAdministrator(interaction)) {
-    await ephemeral(interaction, "❌ Only administrators can lock support ticket creation.");
-    return;
-  }
-  const durationRaw = String(interactionOption(interaction, "duration") || "");
-  const reason = truncate(String(interactionOption(interaction, "reason") || "").trim(), 500);
-  const duration = parseDuration(durationRaw);
-  if (!duration) {
-    await ephemeral(interaction, "❌ Invalid duration. Use formats such as `30m`, `4h`, `2h30m`, or `1d`. Maximum: 30 days.");
-    return;
-  }
-  if (reason.length < 3) {
-    await ephemeral(interaction, "❌ Please provide a reason with at least 3 characters.");
-    return;
-  }
-  const lockedUntil = Date.now() + duration;
-  state.supportLock = { lockedUntil, reason, createdBy: interactionUserId(interaction) };
-  scheduleSupportUnlock();
-  await persistSupportLock();
-  const unix = Math.floor(lockedUntil / 1000);
-  await ephemeral(interaction, `🔒 Support ticket creation is now disabled.\n\n**Reason:** ${reason}\n**Reopens:** <t:${unix}:F> (<t:${unix}:R>)`);
-}
-
-async function handleSupportUnlock(interaction: Interaction): Promise<void> {
-  if (!isAdministrator(interaction)) {
-    await ephemeral(interaction, "❌ Only administrators can unlock support ticket creation.");
-    return;
-  }
-  if (!state.supportLock) {
-    await ephemeral(interaction, "ℹ️ Support ticket creation is already enabled.");
-    return;
-  }
-  clearSupportLockMemory();
-  await persistSupportLock();
-  await ephemeral(interaction, "🟢 Support ticket creation has been enabled again.");
+async function handleStaffRanking(interaction: Interaction): Promise<void> {
+  if (!state.staffRankingLoaded) await loadStaffRanking();
+  await ensureCurrentStaffRankingMonth();
+  await interactionCallback(interaction, 4, { flags: 64, embeds: [{
+    ...embed(`🏆 ${BRAND} • Staff Ranking — ${staffRankingMonthLabel(state.staffRankingMonth)}`, 0xf0b429, "Staff members with the most resolved tickets this month."),
+    description: formatStaffRanking(),
+    footer: { text: "Only completed staff resolutions are counted." }
+  }] });
 }
 
 async function registerCommand(): Promise<void> {
@@ -2237,6 +2300,10 @@ async function registerCommand(): Promise<void> {
       description: `Show ${BRAND} bot status and runtime information`
     },
     {
+      name: "staff-ranking",
+      description: "Show the staff members with the most resolved tickets"
+    },
+    {
       name: "add-user",
       description: "Add another member to the current ticket",
       options: [slashOption("user", "Member to add to this ticket", 6, true)]
@@ -2256,18 +2323,6 @@ async function registerCommand(): Promise<void> {
         slashOption("roles", "Optional staff role IDs with access", 3, false)
       ]
     },
-    {
-      name: "support-lock",
-      description: "Temporarily disable new support ticket creation",
-      options: [
-        slashOption("duration", "Duration such as 30m, 4h, 2h30m, or 1d", 3, true),
-        slashOption("reason", "Why support ticket creation is being disabled", 3, true)
-      ]
-    },
-    {
-      name: "support-unlock",
-      description: "Enable new support ticket creation immediately"
-    }
   ];
   await discordRequest(`/applications/${state.applicationId}/guilds/${cfg().guildId}/commands`, { method: "PUT" }, commands);
   // This bot is intentionally guild-only. Clearing global commands removes stale commands from older releases.
@@ -2422,7 +2477,7 @@ async function main(): Promise<void> {
     console.error(error);
     process.exit(1);
   }
-  await loadSupportLock();
+  await loadStaffRanking();
   setInterval(() => void maintenance().catch((error) => log("maintenance failed", error)), 60000);
   connectGateway();
 }
