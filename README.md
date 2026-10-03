@@ -64,7 +64,7 @@ bun --smol dist/honeylua.js
 Configure the environment variables in the provider. Never commit a real
 `.env` file or a Discord token.
 
-`MAX_TRANSCRIPT_PAGES` defaults to 50 and is capped at 50 to keep transcript
+`MAX_TRANSCRIPT_MESSAGES / MAX_TRANSCRIPT_PAGES` defaults to 50 and is capped at 50 to keep transcript
 closures bounded on a small server. Lower it if tickets can contain a very
 large history. `TRANSCRIPT_PAGE_DELAY_MS` defaults to 250ms to keep pagination
 fast without hammering the Discord API. `DISCORD_REQUEST_TIMEOUT_MS` defaults
