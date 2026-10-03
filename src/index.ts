@@ -466,14 +466,27 @@ async function sendClaimNotice(
   ticket: Ticket,
   title: string,
   color: number,
-  description: string,
-  mentionOwner = false
+  description: string
 ): Promise<void> {
-  const ownerMention = mentionOwner ? `<@${ticket.ownerId}>` : undefined;
-  await sendMessage(ticket.channelId, {
-    content: ownerMention,
+  // Discord only sends a real notification for mentions present in message
+  // content. Mentions inside an embed description are visual only.
+  const message = await sendMessage(ticket.channelId, {
+    content: `<@${ticket.ownerId}>`,
+    allowed_mentions: { users: [ticket.ownerId] },
     embeds: [embed(title, color, description)]
   });
+
+  // Claim/release notices are temporary status notifications. Keep them public
+  // long enough to be seen, then remove the entire Discord message (embed + content).
+  const messageId = typeof message?.id === "string" ? message.id : undefined;
+  if (messageId) {
+    setTimeout(() => {
+      void discordRequest(
+        `/channels/${ticket.channelId}/messages/${messageId}`,
+        { method: "DELETE" }
+      ).catch((error) => log(`temporary claim notice cleanup failed in ${ticket.channelId}`, error));
+    }, 7000);
+  }
 }
 
 async function sendAutoClaimNotice(ticket: Ticket, staffId: Snowflake): Promise<void> {
@@ -1463,6 +1476,44 @@ function ratingButtons(ticketId: Snowflake, disabled = false): Json {
   return row([1, 2, 3, 4, 5].map((stars) => button(`rate_${ticketId}_${stars}`, "⭐".repeat(stars), 2, disabled)));
 }
 
+async function isTicketOwnerAllowedToRate(ticket: Ticket, userId: Snowflake): Promise<boolean> {
+  if (!userId || userId !== ticket.ownerId) return false;
+
+  // A support/admin account must never be able to rate its own support session.
+  // Check both the live interaction member cache and the API so this stays
+  // enforced even when the rating happens in DM.
+  let roles = state.memberRoles.get(userId);
+  let isAdmin = false;
+  if (!roles) {
+    const member = await getGuildMember(userId);
+    if (member === undefined) return false; // Fail closed if the API lookup failed.
+    if (member === null) return true; // Deleted/left member is not a staff account.
+    roles = Array.isArray(member.roles) ? member.roles.map(String) : [];
+    cacheTranscriptMember(userId, displayName(member, member.user), roles);
+    isAdmin = isAdministratorMember(member);
+  } else {
+    isAdmin = roles.some((roleId) => ((state.guildRolePermissions.get(roleId) || 0n) & 8n) === 8n);
+  }
+
+  if (isAdmin) return false;
+  const type = findType(ticket.typeId);
+  const staffRoles = ticketAccessRoleIds(type || TYPES[0], ticket);
+  return !hasAnyRole(roles, staffRoles);
+}
+
+async function rejectStaffSelfRating(interaction: Interaction, ticket: Ticket): Promise<boolean> {
+  const userId = interactionUserId(interaction);
+  if (userId !== ticket.ownerId) {
+    await ephemeral(interaction, "❌ Only the ticket owner can submit a support rating.");
+    return true;
+  }
+  if (!(await isTicketOwnerAllowedToRate(ticket, userId))) {
+    await ephemeral(interaction, "❌ Support staff cannot rate their own ticket.");
+    return true;
+  }
+  return false;
+}
+
 function closeHistoryText(ticket: Ticket): string {
   const history = ticket.closeRequestHistory || [];
   if (!history.length) return "No previous close requests.";
@@ -1480,6 +1531,10 @@ async function disableRatingMessage(interaction: Interaction, ticketId: Snowflak
 
 async function sendRating(ticket: Ticket): Promise<void> {
   if (state.ratingInProgress.has(ticket.id) || state.completedRatings.has(ticket.id)) return;
+  if (!(await isTicketOwnerAllowedToRate(ticket, ticket.ownerId))) {
+    state.ratings.delete(ticket.id);
+    return;
+  }
   if (!state.ratings.has(ticket.id)) {
     state.ratings.set(ticket.id, {
       ticketId: ticket.id,
@@ -1648,10 +1703,7 @@ async function handleRatingPrompt(interaction: Interaction, ticketId: Snowflake)
     await ephemeral(interaction, `⚠️ ${BRAND} ticket not found or already closed.`);
     return;
   }
-  if (userId !== ticket.ownerId) {
-    await ephemeral(interaction, "❌ Only the ticket owner can submit a support rating.");
-    return;
-  }
+  if (await rejectStaffSelfRating(interaction, ticket)) return;
   if (state.completedRatings.has(ticketId) || state.ratingInProgress.has(ticketId)) {
     await ephemeral(interaction, "⚠️ This ticket has already been rated.");
     return;
@@ -1683,6 +1735,11 @@ async function handleRatingClick(interaction: Interaction, stars: number, ticket
     await ephemeral(interaction, "⚠️ This ticket rating is expired or does not belong to you.");
     return;
   }
+  const ticket = state.tickets.get(pending.channelId);
+  if (ticket && !(await isTicketOwnerAllowedToRate(ticket, userId))) {
+    await ephemeral(interaction, "❌ Support staff cannot rate their own ticket.");
+    return;
+  }
   state.ratings.delete(ticketId);
   state.completedRatings.set(ticketId, Date.now());
   state.ratingInProgress.set(ticketId, { ...pending, stars, createdAt: Date.now(), closeAfterRating: true });
@@ -1696,6 +1753,12 @@ async function handleFeedback(interaction: Interaction, ticketId: Snowflake): Pr
   const progress = state.ratingInProgress.get(ticketId);
   if (!progress || progress.ownerId !== userId) {
     await ephemeral(interaction, "⚠️ This feedback form is expired or does not belong to you.");
+    return;
+  }
+  const ticket = state.tickets.get(progress.channelId);
+  if (ticket && !(await isTicketOwnerAllowedToRate(ticket, userId))) {
+    state.ratingInProgress.delete(ticketId);
+    await ephemeral(interaction, "❌ Support staff cannot rate their own ticket.");
     return;
   }
   state.ratingInProgress.delete(ticketId);
@@ -1912,6 +1975,7 @@ async function handleCloseRequest(interaction: Interaction): Promise<void> {
     embeds: [{
       ...embed(`🔔 ${BRAND} • Close Request`, 0xf0b429, "Do you want to close this ticket?"),
       fields: [
+        { name: "Member", value: `<@${ticket.ownerId}>`, inline: true },
         { name: "Reason", value: escapeHtml(reason), inline: false },
         { name: "Requested by", value: `<@${userId}>`, inline: true },
         { name: "Close History", value: truncate(closeHistoryText(ticket), 1024), inline: false }
@@ -1941,6 +2005,10 @@ async function handleCloseRequestDecision(interaction: Interaction, ticketId: Sn
   }
   if (userId !== ticket.ownerId) {
     await ephemeral(interaction, "❌ Only the ticket owner can accept or reject this close request.");
+    return;
+  }
+  if (accept && !(await isTicketOwnerAllowedToRate(ticket, userId))) {
+    await ephemeral(interaction, "❌ Support staff cannot approve a close request and rate their own ticket.");
     return;
   }
   const reason = truncate(ticket.closeRequestReason || ticket.closeRequestHistory?.at(-1)?.reason || "The ticket owner requested closure.", 500);
