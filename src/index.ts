@@ -21,13 +21,9 @@ const STAFF_REPORT_ROLE_IDS = [
 const USER_REPORT_ROLE_ID = "1525161655053320385";
 const BRAND = "Honeylua";
 const SUPPORT_NAME = "Honeylua Support";
-const BOT_VERSION = "2.9.1";
+const BOT_VERSION = "2.10.0";
 const STAFF_RANKING_FILE = "staff-ranking.json";
 const MAX_STAFF_RANKING_ENTRIES = 5000;
-const STAFF_RANKING_MONTH_LABELS = [
-  "January", "February", "March", "April", "May", "June",
-  "July", "August", "September", "October", "November", "December"
-] as const;
 const MAX_MEMBER_CACHE = 2000;
 const MAX_ACTION_COOLDOWN_ENTRIES = 5000;
 const MAX_CREATE_COOLDOWN_ENTRIES = 2000;
@@ -61,6 +57,7 @@ interface Config {
   mentionStaffOnCreate: boolean;
   mentionStaffOnUnclaim: boolean;
   maxTranscriptPages: number;
+  maxTranscriptMessages: number;
   requestTimeoutMs: number;
   transcriptPageDelayMs: number;
   maxTranscriptBytes: number;
@@ -232,7 +229,6 @@ const state = {
   staffResolutions: new Map<Snowflake, number>(),
   staffRankingLoaded: false,
   staffRankingLoad: null as Promise<void> | null,
-  staffRankingMonth: "",
   guildRoleIds: new Set<Snowflake>(),
   guildRoleNames: new Map<Snowflake, string>(),
   guildRolePermissions: new Map<Snowflake, bigint>(),
@@ -241,7 +237,8 @@ const state = {
   guildRolesLoaded: false,
   guildRoleLoad: null as Promise<void> | null,
   ticketsHydrated: false,
-  hydratingTickets: false
+  hydratingTickets: false,
+  maintenanceRunning: false
 };
 
 function requiredEnv(name: string): string {
@@ -273,15 +270,47 @@ function boolEnv(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
-function currentStaffRankingMonth(): string {
+function currentRankingMonth(): string {
   const now = new Date();
   return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-function staffRankingMonthLabel(month: string): string {
-  const [year, rawMonth] = month.split("-").map(Number);
-  const monthName = STAFF_RANKING_MONTH_LABELS[Math.max(0, Math.min(11, (rawMonth || 1) - 1))];
-  return `${monthName} ${year}`;
+async function loadStaffRanking(): Promise<void> {
+  if (state.staffRankingLoaded) return;
+  if (state.staffRankingLoad) return state.staffRankingLoad;
+  const load = (async () => {
+    const month = currentRankingMonth();
+    try {
+      const raw = await Bun.file(STAFF_RANKING_FILE).text();
+      const parsed = JSON.parse(raw);
+      const storedMonth = typeof parsed?.month === "string" ? parsed.month : "";
+      const entries = Array.isArray(parsed?.entries)
+        ? parsed.entries
+        : (Array.isArray(parsed) ? parsed : Object.entries(parsed || {}).map(([id, count]) => ({ id, count })));
+      if (storedMonth && storedMonth !== month) {
+        state.staffResolutions.clear();
+        await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month, entries: [] }));
+      } else {
+        for (const entry of entries) {
+          const id = String(entry?.id || "");
+          const count = Number(entry?.count || 0);
+          if (/^\d{15,25}$/.test(id) && Number.isSafeInteger(count) && count > 0) state.staffResolutions.set(id, count);
+        }
+        // Legacy files had no month marker. Treat them as current-month data once, then migrate.
+        await Bun.write(STAFF_RANKING_FILE, JSON.stringify({
+          month,
+          entries: [...state.staffResolutions.entries()].map(([id, count]) => ({ id, count }))
+        }));
+      }
+    } catch {
+      state.staffResolutions.clear();
+      try { await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month, entries: [] })); } catch {}
+    } finally {
+      state.staffRankingLoaded = true;
+    }
+  })();
+  state.staffRankingLoad = load;
+  try { await load; } finally { if (state.staffRankingLoad === load) state.staffRankingLoad = null; }
 }
 
 async function persistStaffRanking(): Promise<void> {
@@ -291,61 +320,18 @@ async function persistStaffRanking(): Promise<void> {
       .sort((a, b) => b[1] - a[1])
       .slice(0, MAX_STAFF_RANKING_ENTRIES)
       .map(([id, count]) => ({ id, count }));
-    // Only the current month is persisted. Old monthly counters are never retained.
-    await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month: state.staffRankingMonth, entries }));
+    await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month: currentRankingMonth(), entries }));
   } catch (error) {
     log("staff ranking persistence failed", error);
   }
 }
 
-async function loadStaffRanking(): Promise<void> {
-  if (state.staffRankingLoaded) return;
-  if (state.staffRankingLoad) return state.staffRankingLoad;
-  const load = (async () => {
-    const month = currentStaffRankingMonth();
-    state.staffRankingMonth = month;
-    state.staffResolutions.clear();
-    try {
-      const raw = await Bun.file(STAFF_RANKING_FILE).text();
-      const parsed = JSON.parse(raw);
-      const storedMonth = typeof parsed?.month === "string" ? parsed.month : "";
-      const entries = Array.isArray(parsed?.entries)
-        ? parsed.entries
-        : Array.isArray(parsed)
-          ? parsed
-          : Object.entries(parsed || {}).map(([id, count]) => ({ id, count }));
-
-      // If the saved counter belongs to an older month, discard it immediately.
-      if (storedMonth === month || (!storedMonth && entries.length === 0)) {
-        for (const entry of entries) {
-          const id = String(entry?.id || "");
-          const count = Number(entry?.count || 0);
-          if (/^\d{15,25}$/.test(id) && Number.isSafeInteger(count) && count > 0) {
-            state.staffResolutions.set(id, count);
-          }
-        }
-      } else if (storedMonth && storedMonth !== month) {
-        await Bun.write(STAFF_RANKING_FILE, JSON.stringify({ month, entries: [] }));
-      }
-    } catch {
-      // Missing or invalid ranking state starts cleanly.
-    } finally {
-      state.staffRankingLoaded = true;
-    }
-  })();
-  state.staffRankingLoad = load;
-  try { await load; } finally { if (state.staffRankingLoad === load) state.staffRankingLoad = null; }
-}
-
-async function ensureCurrentStaffRankingMonth(): Promise<void> {
-  if (!state.staffRankingLoaded) await loadStaffRanking();
-  const month = currentStaffRankingMonth();
-  if (state.staffRankingMonth === month) return;
-
-  // Month changed: remove the previous month's counters from RAM and disk.
-  state.staffResolutions.clear();
-  state.staffRankingMonth = month;
-  await persistStaffRanking();
+function formatStaffRanking(): string {
+  const month = currentRankingMonth();
+  const ranked = [...state.staffResolutions.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+  const monthName = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(`${month}-01T00:00:00Z`));
+  if (!ranked.length) return `🏆 ${monthName}\n\nNo staff resolutions have been recorded yet.`;
+  return `🏆 ${monthName}\n\n${ranked.map(([id, count], index) => `${["🥇", "🥈", "🥉"][index] || `#${index + 1}`} <@${id}> — **${count}** ticket${count === 1 ? "" : "s"} resolved`).join("\n")}`;
 }
 
 async function isStaffForTicket(ticket: Ticket, userId: Snowflake): Promise<boolean> {
@@ -364,19 +350,13 @@ async function isStaffForTicket(ticket: Ticket, userId: Snowflake): Promise<bool
 
 async function recordStaffResolution(ticket: Ticket, closedBy?: Snowflake): Promise<void> {
   if (!closedBy || !(await isStaffForTicket(ticket, closedBy))) return;
-  await ensureCurrentStaffRankingMonth();
+  if (!state.staffRankingLoaded) await loadStaffRanking();
   if (!state.staffResolutions.has(closedBy) && state.staffResolutions.size >= MAX_STAFF_RANKING_ENTRIES) {
     const lowest = [...state.staffResolutions.entries()].sort((a, b) => a[1] - b[1])[0]?.[0];
     if (lowest) state.staffResolutions.delete(lowest);
   }
   state.staffResolutions.set(closedBy, (state.staffResolutions.get(closedBy) || 0) + 1);
   void persistStaffRanking();
-}
-
-function formatStaffRanking(): string {
-  const ranked = [...state.staffResolutions.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
-  if (!ranked.length) return "No staff resolutions have been recorded yet.";
-  return ranked.map(([id, count], index) => `${index + 1}. <@${id}> — **${count}** ticket${count === 1 ? "" : "s"} resolved`).join("\n");
 }
 
 function loadConfig(): Config {
@@ -394,12 +374,13 @@ function loadConfig(): Config {
     maxTicketsPerGuild: Math.max(1, integerEnv("MAX_TICKETS_PER_GUILD", 50)),
     mentionStaffOnCreate: boolEnv("MENTION_STAFF_ON_CREATE", true),
     mentionStaffOnUnclaim: boolEnv("MENTION_STAFF_ON_UNCLAIM", true),
-    maxTranscriptPages: Math.min(50, Math.max(1, integerEnv("MAX_TRANSCRIPT_PAGES", 50))),
+    maxTranscriptPages: Math.min(12, Math.max(1, integerEnv("MAX_TRANSCRIPT_PAGES", 12))),
+    maxTranscriptMessages: Math.min(1200, Math.max(100, integerEnv("MAX_TRANSCRIPT_MESSAGES", 1000))),
     requestTimeoutMs: Math.min(60_000, Math.max(5_000, integerEnv("DISCORD_REQUEST_TIMEOUT_MS", 15_000))),
     transcriptPageDelayMs: Math.min(2_000, Math.max(100, integerEnv("TRANSCRIPT_PAGE_DELAY_MS", 250))),
     // Keep generated HTML below Discord's commonly available upload ceiling.
     // The transcript will gracefully keep the newest messages if this is exceeded.
-    maxTranscriptBytes: Math.min(18 * 1024 * 1024, Math.max(1 * 1024 * 1024, integerEnv("MAX_TRANSCRIPT_BYTES", 18 * 1024 * 1024))),
+    maxTranscriptBytes: Math.min(4 * 1024 * 1024, Math.max(512 * 1024, integerEnv("MAX_TRANSCRIPT_BYTES", 4 * 1024 * 1024))),
     // Keep the complete offline bundle below Discord's broadly available free upload limit.
   };
 }
@@ -486,23 +467,13 @@ async function sendClaimNotice(
   title: string,
   color: number,
   description: string,
-  mentionOwner = true
+  mentionOwner = false
 ): Promise<void> {
   const ownerMention = mentionOwner ? `<@${ticket.ownerId}>` : undefined;
-  const message = await sendMessage(ticket.channelId, {
+  await sendMessage(ticket.channelId, {
     content: ownerMention,
     embeds: [embed(title, color, description)]
   });
-  if (!message?.id) return;
-
-  // Claim/release notices are temporary. The persistent ticket control message
-  // is updated separately, so the channel does not accumulate bot status messages.
-  setTimeout(() => {
-    void discordRequest(`/channels/${ticket.channelId}/messages/${message.id}`, { method: "DELETE" })
-      .catch((error) => {
-        if (!String(error).includes("Discord 404")) log(`claim notice deletion failed in ${ticket.channelId}`, error);
-      });
-  }, 10_000);
 }
 
 async function sendAutoClaimNotice(ticket: Ticket, staffId: Snowflake): Promise<void> {
@@ -510,7 +481,7 @@ async function sendAutoClaimNotice(ticket: Ticket, staffId: Snowflake): Promise<
     ticket,
     `🔒 ${BRAND} • Ticket Claimed`,
     0xf0b429,
-    `<@${staffId}> started handling this ticket automatically.`
+    `<@${staffId}> is now handling this ticket. The ticket has been claimed automatically because they replied while it was available.`
   );
 }
 
@@ -1176,8 +1147,8 @@ async function handleUnclaim(interaction: Interaction): Promise<void> {
     await ephemeral(interaction, "⚠️ This ticket is not currently claimed.");
     return;
   }
-  if (!isAdministrator(interaction)) {
-    await ephemeral(interaction, "❌ Only administrators can release a claimed ticket.");
+  if (!isAdministrator(interaction) && ticket.claimedBy !== interactionUserId(interaction)) {
+    await ephemeral(interaction, "❌ Only the staff member who claimed this ticket or an administrator can release it.");
     return;
   }
   if (interaction.message?.id) ticket.controlMessageId = interaction.message.id;
@@ -1202,7 +1173,7 @@ async function handleUnclaim(interaction: Interaction): Promise<void> {
     ticket,
     `↩️ ${BRAND} • Ticket Released`,
     0x57f28a,
-    "The ticket is available for an authorized staff member to claim."
+    `<@${interactionUserId(interaction)}> released this ticket. It is available for an authorized staff member to claim.`
   ).catch((error) => log(`release notice failed in ${ticket.channelId}`, error));
 }
 
@@ -1260,12 +1231,13 @@ function renderSticker(sticker: Json): string {
 async function fetchMessages(channelId: Snowflake, extraMemberIds: Snowflake[] = []): Promise<TranscriptCapture> {
   const rawMessages: Json[] = [];
   let before = "";
-  for (let page = 0; page < cfg().maxTranscriptPages; page++) {
-    const query = before ? `?limit=100&before=${before}` : "?limit=100";
+  for (let page = 0; page < cfg().maxTranscriptPages && rawMessages.length < cfg().maxTranscriptMessages; page++) {
+    const remaining = Math.min(100, cfg().maxTranscriptMessages - rawMessages.length);
+    const query = before ? `?limit=${remaining}&before=${before}` : `?limit=${remaining}`;
     const current = await discordRequest(`/channels/${channelId}/messages${query}`);
     if (!Array.isArray(current) || current.length === 0) break;
     rawMessages.push(...current.filter((message: Json) => !isTemporaryTranscriptMessage(message)));
-    if (current.length < 100) break;
+    if (current.length < remaining) break;
     before = current[current.length - 1].id;
     await Bun.sleep(cfg().transcriptPageDelayMs);
   }
@@ -2099,8 +2071,25 @@ async function handleInteraction(interaction: Interaction): Promise<void> {
 }
 
 async function maintenance(): Promise<void> {
-  const now = Date.now();
-  for (const ticket of [...state.tickets.values()]) {
+  if (state.maintenanceRunning) return;
+  state.maintenanceRunning = true;
+  try {
+    const now = Date.now();
+    if (state.staffRankingLoaded) {
+      const storedRaw = await Bun.file(STAFF_RANKING_FILE).text().catch(() => "");
+      if (storedRaw) {
+        try {
+          const stored = JSON.parse(storedRaw);
+          if (stored?.month && stored.month !== currentRankingMonth()) {
+            state.staffResolutions.clear();
+            await persistStaffRanking();
+          }
+        } catch {}
+      }
+    }
+    for (const ticket of [...state.tickets.values()]) {
+    if (state.closing.has(ticket.channelId)) continue;
+    if (state.claiming.has(ticket.channelId)) continue;
     const idle = now - ticket.lastActivity;
     if (idle >= 24 * 60 * 60 * 1000) {
       void closeTicket(ticket, "automatic (24h timeout)").catch((error) => log("automatic close failed", error));
@@ -2130,7 +2119,10 @@ async function maintenance(): Promise<void> {
   for (const [id, created] of state.completedRatings) if (now - created >= 48 * 60 * 60 * 1000) state.completedRatings.delete(id);
   const cooldownTtl = Math.max(cfg().actionCooldownMs, 60000);
   for (const [key, created] of state.actionCooldowns) if (now - created >= cooldownTtl) state.actionCooldowns.delete(key);
-  for (const [id, created] of state.createCooldowns) if (now - created >= Math.max(cfg().cooldownCreateMs, 60000)) state.createCooldowns.delete(id);
+    for (const [id, created] of state.createCooldowns) if (now - created >= Math.max(cfg().cooldownCreateMs, 60000)) state.createCooldowns.delete(id);
+  } finally {
+    state.maintenanceRunning = false;
+  }
 }
 
 function snowflakeCreatedAt(id: Snowflake): number {
@@ -2270,11 +2262,11 @@ function slashOption(name: string, description: string, type = 3, required = fal
 
 async function handleStaffRanking(interaction: Interaction): Promise<void> {
   if (!state.staffRankingLoaded) await loadStaffRanking();
-  await ensureCurrentStaffRankingMonth();
+  const monthLabel = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date());
   await interactionCallback(interaction, 4, { flags: 64, embeds: [{
-    ...embed(`🏆 ${BRAND} • Staff Ranking — ${staffRankingMonthLabel(state.staffRankingMonth)}`, 0xf0b429, "Staff members with the most resolved tickets this month."),
+    ...embed(`🏆 ${BRAND} • Staff Ranking — ${monthLabel}`, 0xf0b429, "Current-month resolved ticket count."),
     description: formatStaffRanking(),
-    footer: { text: "Only completed staff resolutions are counted." }
+    footer: { text: "The counter resets automatically when the month changes." }
   }] });
 }
 
